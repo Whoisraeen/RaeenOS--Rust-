@@ -38,7 +38,6 @@ impl From<NetworkError> for crate::syscall::SyscallError {
 pub type NetworkResult<T> = Result<T, NetworkError>;
 
 use alloc::collections::BTreeMap;
-use alloc::vec::Vec;
 use spin::Mutex;
 use lazy_static::lazy_static;
 
@@ -138,7 +137,7 @@ pub fn create_socket(domain: u32, socket_type: u32, protocol: u32) -> NetworkRes
     let current_pid = crate::process::get_current_process_id();
     
     // Check permission
-    if !crate::security::request_permission(current_pid, "network.access").unwrap_or(false) {
+    if !crate::security::request_permission(current_pid as u32, "network.access").unwrap_or(false) {
         return Err(NetworkError::PermissionDenied);
     }
     
@@ -166,7 +165,7 @@ pub fn create_socket(domain: u32, socket_type: u32, protocol: u32) -> NetworkRes
     let socket_fd = network.next_socket_fd;
     network.next_socket_fd += 1;
     
-    let socket = Socket::new(domain, socket_type, protocol, current_pid);
+    let socket = Socket::new(domain, socket_type, protocol, current_pid as u32);
     network.sockets.insert(socket_fd, socket);
     
     Ok(socket_fd)
@@ -176,27 +175,32 @@ pub fn bind_socket(socket_fd: u32, addr: &[u8]) -> NetworkResult<()> {
     let mut network = NETWORK_SYSTEM.lock();
     let current_pid = crate::process::get_current_process_id();
     
-    let socket = network.sockets.get_mut(&socket_fd)
-        .ok_or(NetworkError::InvalidSocket)?;
-    
-    // Check ownership
-    if socket.process_id != current_pid {
-        return Err(NetworkError::PermissionDenied);
-    }
-    
-    // Check state
-    if socket.state != SocketState::Created {
-        return Err(NetworkError::AlreadyBound);
-    }
-    
-    let socket_addr = SocketAddr::from_bytes(addr)?;
+    // First, validate the socket and parse address
+    let socket_addr = {
+        let socket = network.sockets.get(&socket_fd)
+            .ok_or(NetworkError::InvalidSocket)?;
+        
+        // Check ownership
+        if socket.process_id != current_pid as u32 {
+            return Err(NetworkError::PermissionDenied);
+        }
+        
+        // Check state
+        if socket.state != SocketState::Created {
+            return Err(NetworkError::ConnectionRefused);
+        }
+        
+        SocketAddr::from_bytes(addr)?
+    };
     
     // Check if port is already in use
     if network.port_allocations.contains_key(&socket_addr.port) {
-        return Err(NetworkError::AddressInUse);
+        return Err(NetworkError::PortInUse);
     }
     
     // Bind the socket
+    let socket = network.sockets.get_mut(&socket_fd)
+        .ok_or(NetworkError::InvalidSocket)?;
     socket.local_addr = Some(socket_addr.clone());
     socket.state = SocketState::Bound;
     network.port_allocations.insert(socket_addr.port, socket_fd);
@@ -212,18 +216,18 @@ pub fn listen_socket(socket_fd: u32, backlog: u32) -> NetworkResult<()> {
         .ok_or(NetworkError::InvalidSocket)?;
     
     // Check ownership
-    if socket.process_id != current_pid {
+    if socket.process_id != current_pid as u32 {
         return Err(NetworkError::PermissionDenied);
     }
     
     // Check socket type (only TCP can listen)
     if socket.socket_type != SOCK_STREAM {
-        return Err(NetworkError::OperationNotSupported);
+        return Err(NetworkError::ProtocolNotSupported);
     }
     
     // Check state
     if socket.state != SocketState::Bound {
-        return Err(NetworkError::NotBound);
+        return Err(NetworkError::NotConnected);
     }
     
     socket.state = SocketState::Listening;
@@ -237,39 +241,43 @@ pub fn accept_connection(socket_fd: u32) -> NetworkResult<u32> {
     let mut network = NETWORK_SYSTEM.lock();
     let current_pid = crate::process::get_current_process_id();
     
-    let socket = network.sockets.get_mut(&socket_fd)
-        .ok_or(NetworkError::InvalidSocket)?;
-    
-    // Check ownership
-    if socket.process_id != current_pid {
-        return Err(NetworkError::PermissionDenied);
-    }
-    
-    // Check state
-    if socket.state != SocketState::Listening {
-        return Err(NetworkError::NotListening);
-    }
-    
-    // Check for pending connections
-    if socket.pending_connections.is_empty() {
-        return Err(NetworkError::WouldBlock);
-    }
+    // First, validate the socket and extract needed values
+    let (domain, socket_type, protocol, local_addr) = {
+        let socket = network.sockets.get(&socket_fd)
+            .ok_or(NetworkError::InvalidSocket)?;
+        
+        // Check ownership
+        if socket.process_id != current_pid as u32 {
+            return Err(NetworkError::PermissionDenied);
+        }
+        
+        // Check state
+        if socket.state != SocketState::Listening {
+            return Err(NetworkError::NotConnected);
+        }
+        
+        // Check for pending connections
+        if socket.pending_connections.is_empty() {
+            return Err(NetworkError::WouldBlock);
+        }
+        
+        (socket.domain, socket.socket_type, socket.protocol, socket.local_addr.clone())
+    };
     
     // Accept the first pending connection
-    let client_fd = socket.pending_connections.remove(0);
+    let _client_fd = {
+        let socket = network.sockets.get_mut(&socket_fd)
+            .ok_or(NetworkError::InvalidSocket)?;
+        socket.pending_connections.remove(0)
+    };
     
-    // In a real implementation, we would:
-    // 1. Create a new socket for the accepted connection
-    // 2. Set up the connection state
-    // 3. Return the new socket file descriptor
-    
-    // For now, return a placeholder
+    // Create a new socket for the accepted connection
     let new_socket_fd = network.next_socket_fd;
     network.next_socket_fd += 1;
     
-    let mut client_socket = Socket::new(socket.domain, socket.socket_type, socket.protocol, current_pid);
+    let mut client_socket = Socket::new(domain, socket_type, protocol, current_pid as u32);
     client_socket.state = SocketState::Connected;
-    client_socket.local_addr = socket.local_addr.clone();
+    client_socket.local_addr = local_addr;
     
     network.sockets.insert(new_socket_fd, client_socket);
     
@@ -280,41 +288,51 @@ pub fn connect_socket(socket_fd: u32, addr: &[u8]) -> NetworkResult<()> {
     let mut network = NETWORK_SYSTEM.lock();
     let current_pid = crate::process::get_current_process_id();
     
-    let socket = network.sockets.get_mut(&socket_fd)
-        .ok_or(NetworkError::InvalidSocket)?;
+    // First, validate the socket and get remote address
+    let (remote_addr, target_socket_fd) = {
+        let socket = network.sockets.get(&socket_fd)
+            .ok_or(NetworkError::InvalidSocket)?;
+        
+        // Check ownership
+        if socket.process_id != current_pid as u32 {
+            return Err(NetworkError::PermissionDenied);
+        }
+        
+        // Check state
+        if socket.state != SocketState::Created && socket.state != SocketState::Bound {
+            return Err(NetworkError::ConnectionRefused);
+        }
+        
+        let remote_addr = SocketAddr::from_bytes(addr)?;
+        
+        // Check if there's a listening socket on the target address
+        let target_socket_fd = network.port_allocations.get(&remote_addr.port)
+            .copied()
+            .ok_or(NetworkError::ConnectionRefused)?;
+        
+        (remote_addr, target_socket_fd)
+    };
     
-    // Check ownership
-    if socket.process_id != current_pid {
-        return Err(NetworkError::PermissionDenied);
+    // Validate target socket and add to pending connections
+    {
+        let target_socket = network.sockets.get_mut(&target_socket_fd)
+            .ok_or(NetworkError::ConnectionRefused)?;
+        
+        if target_socket.state != SocketState::Listening {
+            return Err(NetworkError::ConnectionRefused);
+        }
+        
+        // Add to pending connections if there's space
+        if target_socket.pending_connections.len() >= target_socket.backlog as usize {
+            return Err(NetworkError::ConnectionRefused);
+        }
+        
+        target_socket.pending_connections.push(socket_fd);
     }
-    
-    // Check state
-    if socket.state != SocketState::Created && socket.state != SocketState::Bound {
-        return Err(NetworkError::AlreadyConnected);
-    }
-    
-    let remote_addr = SocketAddr::from_bytes(addr)?;
-    
-    // Check if there's a listening socket on the target address
-    let target_socket_fd = network.port_allocations.get(&remote_addr.port)
-        .copied()
-        .ok_or(NetworkError::ConnectionRefused)?;
-    
-    let target_socket = network.sockets.get_mut(&target_socket_fd)
-        .ok_or(NetworkError::ConnectionRefused)?;
-    
-    if target_socket.state != SocketState::Listening {
-        return Err(NetworkError::ConnectionRefused);
-    }
-    
-    // Add to pending connections if there's space
-    if target_socket.pending_connections.len() >= target_socket.backlog as usize {
-        return Err(NetworkError::ConnectionRefused);
-    }
-    
-    target_socket.pending_connections.push(socket_fd);
     
     // Update socket state
+    let socket = network.sockets.get_mut(&socket_fd)
+        .ok_or(NetworkError::InvalidSocket)?;
     socket.remote_addr = Some(remote_addr);
     socket.state = SocketState::Connected;
     
@@ -329,7 +347,7 @@ pub fn send_data(socket_fd: u32, data: &[u8], flags: u32) -> NetworkResult<usize
         .ok_or(NetworkError::InvalidSocket)?;
     
     // Check ownership
-    if socket.process_id != current_pid {
+    if socket.process_id != current_pid as u32 {
         return Err(NetworkError::PermissionDenied);
     }
     
@@ -342,10 +360,10 @@ pub fn send_data(socket_fd: u32, data: &[u8], flags: u32) -> NetworkResult<usize
         }
         SOCK_DGRAM => {
             if socket.state != SocketState::Bound && socket.state != SocketState::Connected {
-                return Err(NetworkError::NotBound);
+                return Err(NetworkError::NotConnected);
             }
         }
-        _ => return Err(NetworkError::OperationNotSupported),
+        _ => return Err(NetworkError::ProtocolNotSupported),
     }
     
     // Add data to send buffer (simplified)
@@ -369,9 +387,9 @@ pub fn receive_data(socket_fd: u32, length: usize, flags: u32) -> NetworkResult<
         .ok_or(NetworkError::InvalidSocket)?;
     
     // Check ownership
-    if socket.process_id != current_pid {
-        return Err(NetworkError::PermissionDenied);
-    }
+    if socket.process_id != current_pid as u32 {
+            return Err(NetworkError::PermissionDenied);
+        }
     
     // Check state
     match socket.socket_type {
@@ -382,10 +400,10 @@ pub fn receive_data(socket_fd: u32, length: usize, flags: u32) -> NetworkResult<
         }
         SOCK_DGRAM => {
             if socket.state != SocketState::Bound && socket.state != SocketState::Connected {
-                return Err(NetworkError::NotBound);
+                return Err(NetworkError::NotConnected);
             }
         }
-        _ => return Err(NetworkError::OperationNotSupported),
+        _ => return Err(NetworkError::ProtocolNotSupported),
     }
     
     // Check if data is available
@@ -405,17 +423,22 @@ pub fn close_socket(socket_fd: u32) -> NetworkResult<()> {
     let mut network = NETWORK_SYSTEM.lock();
     let current_pid = crate::process::get_current_process_id();
     
-    let socket = network.sockets.get(&socket_fd)
-        .ok_or(NetworkError::InvalidSocket)?;
-    
-    // Check ownership
-    if socket.process_id != current_pid {
-        return Err(NetworkError::PermissionDenied);
-    }
+    // Extract needed values before mutable operations
+    let local_port = {
+        let socket = network.sockets.get(&socket_fd)
+            .ok_or(NetworkError::InvalidSocket)?;
+        
+        // Check ownership
+        if socket.process_id != current_pid as u32 {
+            return Err(NetworkError::PermissionDenied);
+        }
+        
+        socket.local_addr.as_ref().map(|addr| addr.port)
+    };
     
     // Free port allocation if bound
-    if let Some(local_addr) = &socket.local_addr {
-        network.port_allocations.remove(&local_addr.port);
+    if let Some(port) = local_port {
+        network.port_allocations.remove(&port);
     }
     
     // Remove socket
@@ -433,7 +456,7 @@ pub fn get_socket_info(socket_fd: u32) -> NetworkResult<(SocketState, Option<Soc
         .ok_or(NetworkError::InvalidSocket)?;
     
     // Check ownership
-    if socket.process_id != current_pid {
+    if socket.process_id != current_pid as u32 {
         return Err(NetworkError::PermissionDenied);
     }
     

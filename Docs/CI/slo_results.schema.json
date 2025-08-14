@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "slo_results",
+  "type": "object",
+  "properties": {
+    "platform": {"type": "string"},
+    "metrics": {
+      "type": "object",
+      "patternProperties": {
+        "^[a-z0-9_\\.]+$": {"type": "number"}
+      },
+      "additionalProperties": false
+    }
+  },
+  "required": ["platform", "metrics"]
+}
+

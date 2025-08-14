@@ -427,6 +427,13 @@ pub fn get_current_process_info() -> Option<(u64, alloc::string::String, Process
     scheduler.get_current_process().map(|p| (p.pid, p.name.clone(), p.state))
 }
 
+pub fn get_current_process_id() -> u64 {
+    let scheduler = SCHEDULER.lock();
+    scheduler.current_process.unwrap_or(0)
+}
+
+
+
 // Context switching function using inline assembly
 unsafe fn switch_context(old_context: *mut ProcessContext, new_context: *const ProcessContext) {
     if !old_context.is_null() {
@@ -664,8 +671,7 @@ pub fn exec_process(path: &str, args: &[&str]) -> Result<(), ()> {
     }
     
     // Try to load the executable from filesystem
-    let fs = crate::filesystem::get_filesystem();
-    let file_data = fs.read_file(path).map_err(|_| ())?;
+    let file_data = crate::filesystem::read_file(path).map_err(|_| ())?;
     
     // Basic ELF header validation (simplified)
     if file_data.len() < 4 || &file_data[0..4] != b"\x7fELF" {

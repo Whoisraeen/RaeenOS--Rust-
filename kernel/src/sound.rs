@@ -50,7 +50,7 @@ pub fn play_tone(frequency: u32, duration_ms: u32) -> Result<(), ()> {
         // Configure PIT channel 2
         let mut cmd_port = Port::new(PIT_COMMAND);
         let mut data_port = Port::new(PIT_CHANNEL_2);
-        let mut speaker_port = Port::new(SPEAKER_PORT);
+        let mut speaker_port: Port<u8> = Port::new(SPEAKER_PORT);
         
         // Set PIT to mode 3 (square wave generator)
         cmd_port.write(0xB6u8);
@@ -60,7 +60,7 @@ pub fn play_tone(frequency: u32, duration_ms: u32) -> Result<(), ()> {
         data_port.write((divisor >> 8) as u8);
         
         // Enable speaker
-        let speaker_value = speaker_port.read() | 0x03;
+        let speaker_value: u8 = speaker_port.read() | 0x03;
         speaker_port.write(speaker_value);
     }
     
@@ -76,8 +76,8 @@ pub fn stop_sound() -> Result<(), ()> {
     let mut sound = SOUND_SYSTEM.lock();
     
     unsafe {
-        let mut speaker_port = Port::new(SPEAKER_PORT);
-        let speaker_value = speaker_port.read() & 0xFC;
+        let mut speaker_port: Port<u8> = Port::new(SPEAKER_PORT);
+        let speaker_value: u8 = speaker_port.read() & 0xFC;
         speaker_port.write(speaker_value);
     }
     

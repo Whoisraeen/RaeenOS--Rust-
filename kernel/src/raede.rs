@@ -2,6 +2,7 @@
 
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
+use alloc::vec;
 use alloc::collections::BTreeMap;
 use spin::Mutex;
 use lazy_static::lazy_static;
@@ -316,7 +317,7 @@ pub fn init_raede() -> Result<(), ()> {
     let current_pid = crate::process::get_current_process_id();
     
     // Check permission
-    if !crate::security::request_permission(current_pid, "raede.init").unwrap_or(false) {
+    if !crate::security::request_permission(current_pid as u32, "raede.init").unwrap_or(false) {
         return Err(());
     }
     
@@ -333,7 +334,7 @@ pub fn create_session() -> Result<u32, ()> {
     let current_pid = crate::process::get_current_process_id();
     
     // Check permission
-    if !crate::security::request_permission(current_pid, "raede.session").unwrap_or(false) {
+    if !crate::security::request_permission(current_pid as u32, "raede.session").unwrap_or(false) {
         return Err(());
     }
     
@@ -353,7 +354,7 @@ pub fn open_file(session_id: u32, file_path: &str) -> Result<(), ()> {
     let current_pid = crate::process::get_current_process_id();
     
     // Check permission
-    if !crate::security::request_permission(current_pid, "raede.file.open").unwrap_or(false) {
+    if !crate::security::request_permission(current_pid as u32, "raede.file.open").unwrap_or(false) {
         return Err(());
     }
     
@@ -388,7 +389,7 @@ pub fn save_file(session_id: u32, file_path: Option<&str>) -> Result<(), ()> {
     let current_pid = crate::process::get_current_process_id();
     
     // Check permission
-    if !crate::security::request_permission(current_pid, "raede.file.save").unwrap_or(false) {
+    if !crate::security::request_permission(current_pid as u32, "raede.file.save").unwrap_or(false) {
         return Err(());
     }
     
@@ -403,15 +404,49 @@ pub fn save_file(session_id: u32, file_path: Option<&str>) -> Result<(), ()> {
     };
     
     let content = session.buffer.get_text();
-    match crate::fs::write_file(path, content.as_bytes()) {
-        Ok(_) => {
-            session.buffer.file_path = Some(path.to_string());
-            session.buffer.modified = false;
-            session.detect_syntax_type();
-            Ok(())
+    match crate::fs::create_file(path) {
+        Ok(()) => {
+            match crate::fs::open_file(path) {
+                Ok(fd) => {
+                    match crate::fs::write_file(fd, content.as_bytes()) {
+                        Ok(_) => {
+                            let _ = crate::fs::close_file(fd);
+                            session.buffer.file_path = Some(path.to_string());
+                            session.buffer.modified = false;
+                            session.detect_syntax_type();
+                            Ok(())
+                        }
+                        Err(_) => {
+                            let _ = crate::fs::close_file(fd);
+                            Err(())
+                        }
+                    }
+                }
+                Err(_) => Err(())
+            }
         }
-        Err(_) => Err(()),
-    }
+        Err(_) => {
+            // File might already exist, try to open it
+            match crate::fs::open_file(path) {
+                Ok(fd) => {
+                    match crate::fs::write_file(fd, content.as_bytes()) {
+                        Ok(_) => {
+                            let _ = crate::fs::close_file(fd);
+                            session.buffer.file_path = Some(path.to_string());
+                            session.buffer.modified = false;
+                            session.detect_syntax_type();
+                            Ok(())
+                        }
+                        Err(_) => {
+                            let _ = crate::fs::close_file(fd);
+                            Err(())
+                        }
+                    }
+                }
+                Err(_) => Err(())
+            }
+        }
+      }
 }
 
 // Insert text at cursor position
@@ -420,7 +455,7 @@ pub fn insert_text(session_id: u32, text: &str) -> Result<(), ()> {
     let current_pid = crate::process::get_current_process_id();
     
     // Check permission
-    if !crate::security::request_permission(current_pid, "raede.edit").unwrap_or(false) {
+    if !crate::security::request_permission(current_pid as u32, "raede.edit").unwrap_or(false) {
         return Err(());
     }
     
@@ -444,7 +479,7 @@ pub fn delete_char(session_id: u32) -> Result<(), ()> {
     let current_pid = crate::process::get_current_process_id();
     
     // Check permission
-    if !crate::security::request_permission(current_pid, "raede.edit").unwrap_or(false) {
+    if !crate::security::request_permission(current_pid as u32, "raede.edit").unwrap_or(false) {
         return Err(());
     }
     
@@ -461,7 +496,7 @@ pub fn move_cursor(session_id: u32, direction: &str) -> Result<(), ()> {
     let current_pid = crate::process::get_current_process_id();
     
     // Check permission
-    if !crate::security::request_permission(current_pid, "raede.navigate").unwrap_or(false) {
+    if !crate::security::request_permission(current_pid as u32, "raede.navigate").unwrap_or(false) {
         return Err(());
     }
     
@@ -487,7 +522,7 @@ pub fn get_cursor_position(session_id: u32) -> Result<(usize, usize), ()> {
     let current_pid = crate::process::get_current_process_id();
     
     // Check permission
-    if !crate::security::request_permission(current_pid, "raede.info").unwrap_or(false) {
+    if !crate::security::request_permission(current_pid as u32, "raede.info").unwrap_or(false) {
         return Err(());
     }
     
@@ -501,7 +536,7 @@ pub fn get_buffer_content(session_id: u32) -> Result<String, ()> {
     let current_pid = crate::process::get_current_process_id();
     
     // Check permission
-    if !crate::security::request_permission(current_pid, "raede.read").unwrap_or(false) {
+    if !crate::security::request_permission(current_pid as u32, "raede.read").unwrap_or(false) {
         return Err(());
     }
     
@@ -515,7 +550,7 @@ pub fn get_line(session_id: u32, line_num: usize) -> Result<Option<String>, ()> 
     let current_pid = crate::process::get_current_process_id();
     
     // Check permission
-    if !crate::security::request_permission(current_pid, "raede.read").unwrap_or(false) {
+    if !crate::security::request_permission(current_pid as u32, "raede.read").unwrap_or(false) {
         return Err(());
     }
     
@@ -529,7 +564,7 @@ pub fn get_line_count(session_id: u32) -> Result<usize, ()> {
     let current_pid = crate::process::get_current_process_id();
     
     // Check permission
-    if !crate::security::request_permission(current_pid, "raede.info").unwrap_or(false) {
+    if !crate::security::request_permission(current_pid as u32, "raede.info").unwrap_or(false) {
         return Err(());
     }
     
@@ -543,7 +578,7 @@ pub fn undo(session_id: u32) -> Result<bool, ()> {
     let current_pid = crate::process::get_current_process_id();
     
     // Check permission
-    if !crate::security::request_permission(current_pid, "raede.edit").unwrap_or(false) {
+    if !crate::security::request_permission(current_pid as u32, "raede.edit").unwrap_or(false) {
         return Err(());
     }
     
@@ -557,7 +592,7 @@ pub fn redo(session_id: u32) -> Result<bool, ()> {
     let current_pid = crate::process::get_current_process_id();
     
     // Check permission
-    if !crate::security::request_permission(current_pid, "raede.edit").unwrap_or(false) {
+    if !crate::security::request_permission(current_pid as u32, "raede.edit").unwrap_or(false) {
         return Err(());
     }
     
@@ -571,7 +606,7 @@ pub fn search(session_id: u32, query: &str) -> Result<Vec<(usize, usize)>, ()> {
     let current_pid = crate::process::get_current_process_id();
     
     // Check permission
-    if !crate::security::request_permission(current_pid, "raede.search").unwrap_or(false) {
+    if !crate::security::request_permission(current_pid as u32, "raede.search").unwrap_or(false) {
         return Err(());
     }
     
@@ -597,7 +632,7 @@ pub fn replace(session_id: u32, search: &str, replace: &str, replace_all: bool) 
     let current_pid = crate::process::get_current_process_id();
     
     // Check permission
-    if !crate::security::request_permission(current_pid, "raede.edit").unwrap_or(false) {
+    if !crate::security::request_permission(current_pid as u32, "raede.edit").unwrap_or(false) {
         return Err(());
     }
     
@@ -633,7 +668,7 @@ pub fn set_mode(session_id: u32, mode: &str) -> Result<(), ()> {
     let current_pid = crate::process::get_current_process_id();
     
     // Check permission
-    if !crate::security::request_permission(current_pid, "raede.mode").unwrap_or(false) {
+    if !crate::security::request_permission(current_pid as u32, "raede.mode").unwrap_or(false) {
         return Err(());
     }
     
@@ -656,7 +691,7 @@ pub fn get_config(session_id: u32) -> Result<(usize, bool, bool, bool, bool, boo
     let current_pid = crate::process::get_current_process_id();
     
     // Check permission
-    if !crate::security::request_permission(current_pid, "raede.config").unwrap_or(false) {
+    if !crate::security::request_permission(current_pid as u32, "raede.config").unwrap_or(false) {
         return Err(());
     }
     
@@ -680,7 +715,7 @@ pub fn set_config(session_id: u32, tab_size: usize, use_spaces: bool, show_line_
     let current_pid = crate::process::get_current_process_id();
     
     // Check permission
-    if !crate::security::request_permission(current_pid, "raede.config").unwrap_or(false) {
+    if !crate::security::request_permission(current_pid as u32, "raede.config").unwrap_or(false) {
         return Err(());
     }
     
@@ -702,7 +737,7 @@ pub fn get_recent_files() -> Result<Vec<String>, ()> {
     let current_pid = crate::process::get_current_process_id();
     
     // Check permission
-    if !crate::security::request_permission(current_pid, "raede.files").unwrap_or(false) {
+    if !crate::security::request_permission(current_pid as u32, "raede.files").unwrap_or(false) {
         return Err(());
     }
     
@@ -715,7 +750,7 @@ pub fn close_session(session_id: u32) -> Result<(), ()> {
     let current_pid = crate::process::get_current_process_id();
     
     // Check permission
-    if !crate::security::request_permission(current_pid, "raede.session").unwrap_or(false) {
+    if !crate::security::request_permission(current_pid as u32, "raede.session").unwrap_or(false) {
         return Err(());
     }
     
@@ -734,7 +769,7 @@ pub fn get_active_session() -> Result<Option<u32>, ()> {
     let current_pid = crate::process::get_current_process_id();
     
     // Check permission
-    if !crate::security::request_permission(current_pid, "raede.session").unwrap_or(false) {
+    if !crate::security::request_permission(current_pid as u32, "raede.session").unwrap_or(false) {
         return Err(());
     }
     
@@ -747,7 +782,7 @@ pub fn set_active_session(session_id: u32) -> Result<(), ()> {
     let current_pid = crate::process::get_current_process_id();
     
     // Check permission
-    if !crate::security::request_permission(current_pid, "raede.session").unwrap_or(false) {
+    if !crate::security::request_permission(current_pid as u32, "raede.session").unwrap_or(false) {
         return Err(());
     }
     
@@ -765,7 +800,7 @@ pub fn is_modified(session_id: u32) -> Result<bool, ()> {
     let current_pid = crate::process::get_current_process_id();
     
     // Check permission
-    if !crate::security::request_permission(current_pid, "raede.info").unwrap_or(false) {
+    if !crate::security::request_permission(current_pid as u32, "raede.info").unwrap_or(false) {
         return Err(());
     }
     
@@ -779,7 +814,7 @@ pub fn get_file_path(session_id: u32) -> Result<Option<String>, ()> {
     let current_pid = crate::process::get_current_process_id();
     
     // Check permission
-    if !crate::security::request_permission(current_pid, "raede.info").unwrap_or(false) {
+    if !crate::security::request_permission(current_pid as u32, "raede.info").unwrap_or(false) {
         return Err(());
     }
     

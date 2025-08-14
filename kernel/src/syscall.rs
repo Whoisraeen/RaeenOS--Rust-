@@ -445,8 +445,8 @@ fn sys_mprotect(addr: u64, length: u64, prot: u64) -> SyscallResult {
 
 fn sys_brk(addr: u64) -> SyscallResult {
     // Implement heap management
-    match crate::memory::set_program_break(addr) {
-        Ok(new_break) => SyscallResult::success(new_break as i64),
+    match crate::memory::set_program_break(VirtAddr::new(addr)) {
+        Ok(new_break) => SyscallResult::success(new_break.as_u64() as i64),
         Err(_) => SyscallResult::error(SyscallError::OutOfMemory)
     }
 }
@@ -498,14 +498,8 @@ fn sys_listen(socket_fd: u64, backlog: u64) -> SyscallResult {
 fn sys_accept(socket_fd: u64, addr: u64, addr_len: u64) -> SyscallResult {
     // Implement socket accepting
     match crate::network::accept_connection(socket_fd as u32) {
-        Ok((new_fd, peer_addr)) => {
-            if addr != 0 && addr_len > 0 {
-                let addr_bytes = peer_addr.as_bytes();
-                let copy_len = core::cmp::min(addr_bytes.len(), addr_len as usize);
-                unsafe {
-                    copy_to_user(addr, &addr_bytes[..copy_len]);
-                }
-            }
+        Ok(new_fd) => {
+            // TODO: Implement peer address retrieval if needed
             SyscallResult::success(new_fd as i64)
         }
         Err(_) => SyscallResult::error(SyscallError::InvalidArgument)
@@ -679,7 +673,7 @@ fn sys_request_permission(permission: u64) -> SyscallResult {
         _ => "unknown"
     };
     
-    match crate::security::request_permission(current_pid, permission_str) {
+    match crate::security::request_permission(current_pid as u32, permission_str) {
         Ok(granted) => SyscallResult::success(if granted { 1 } else { 0 }),
         Err(_) => SyscallResult::error(SyscallError::PermissionDenied)
     }
@@ -752,7 +746,7 @@ fn sys_ai_analyze(data: u64, analysis_buffer: u64, buffer_size: u64) -> SyscallR
     
     match crate::rae_assistant::analyze_content(&data_str) {
         Ok(analysis) => {
-            let analysis_bytes = analysis.as_bytes();
+            let analysis_bytes = analysis.as_slice();
             let copy_len = core::cmp::min(analysis_bytes.len(), buffer_size as usize - 1);
             
             unsafe {

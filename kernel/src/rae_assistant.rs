@@ -2,6 +2,8 @@
 
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
+use alloc::vec;
+use alloc::format;
 use alloc::collections::BTreeMap;
 use spin::Mutex;
 use lazy_static::lazy_static;
@@ -80,11 +82,7 @@ fn match_response_pattern(prompt: &str) -> ResponseType {
     // System information queries
     if prompt_lower.contains("system") && (prompt_lower.contains("info") || prompt_lower.contains("status")) {
         let system_info = format!(
-            "RaeenOS Kernel Assistant\n"
-            "- Memory: {} KB available\n"
-            "- Processes: {} active\n"
-            "- Uptime: {} ticks\n"
-            "- Security: Sandbox enabled",
+            "RaeenOS Kernel Assistant\n- Memory: {} KB available\n- Processes: {} active\n- Uptime: {} ticks\n- Security: Sandbox enabled",
             crate::memory::get_free_memory() / 1024,
             crate::process::get_process_count(),
             crate::time::get_system_uptime()
@@ -94,13 +92,7 @@ fn match_response_pattern(prompt: &str) -> ResponseType {
     
     // Help queries
     if prompt_lower.contains("help") || prompt_lower.contains("how") {
-        let help_text = "RaeenOS Assistant Help:\n"
-            "- Ask about system status: 'system info'\n"
-            "- Get process information: 'list processes'\n"
-            "- Memory usage: 'memory status'\n"
-            "- File operations: 'file help'\n"
-            "- Network commands: 'network help'\n"
-            "- Security info: 'security status'";
+        let help_text = "RaeenOS Assistant Help:\n- Ask about system status: 'system info'\n- Get process information: 'list processes'\n- Memory usage: 'memory status'\n- File operations: 'file help'\n- Network commands: 'network help'\n- Security info: 'security status'";
         return ResponseType::Text(help_text.to_string());
     }
     
@@ -108,10 +100,7 @@ fn match_response_pattern(prompt: &str) -> ResponseType {
     if prompt_lower.contains("process") {
         if prompt_lower.contains("list") || prompt_lower.contains("show") {
             let process_info = format!(
-                "Active Processes:\n"
-                "- Current PID: {}\n"
-                "- Total processes: {}\n"
-                "- Scheduler status: Active",
+                "Active Processes:\n- Current PID: {}\n- Total processes: {}\n- Scheduler status: Active",
                 crate::process::get_current_process_id(),
                 crate::process::get_process_count()
             );
@@ -122,11 +111,7 @@ fn match_response_pattern(prompt: &str) -> ResponseType {
     // Memory queries
     if prompt_lower.contains("memory") {
         let memory_info = format!(
-            "Memory Status:\n"
-            "- Total: {} KB\n"
-            "- Free: {} KB\n"
-            "- Used: {} KB\n"
-            "- Fragmentation: Low",
+            "Memory Status:\n- Total: {} KB\n- Free: {} KB\n- Used: {} KB\n- Fragmentation: Low",
             crate::memory::get_total_memory() / 1024,
             crate::memory::get_free_memory() / 1024,
             (crate::memory::get_total_memory() - crate::memory::get_free_memory()) / 1024
@@ -136,35 +121,20 @@ fn match_response_pattern(prompt: &str) -> ResponseType {
     
     // File system queries
     if prompt_lower.contains("file") {
-        let file_help = "File System Commands:\n"
-            "- open(path): Open a file\n"
-            "- read(fd, size): Read from file\n"
-            "- write(fd, data): Write to file\n"
-            "- close(fd): Close file\n"
-            "- create(path): Create new file\n"
-            "- remove(path): Delete file";
+        let file_help = "File System Commands:\n- open(path): Open a file\n- read(fd, size): Read from file\n- write(fd, data): Write to file\n- close(fd): Close file\n- create(path): Create new file\n- remove(path): Delete file";
         return ResponseType::Text(file_help.to_string());
     }
     
     // Network queries
     if prompt_lower.contains("network") {
-        let network_help = "Network Commands:\n"
-            "- create_socket(): Create network socket\n"
-            "- bind_socket(): Bind to address\n"
-            "- connect_socket(): Connect to remote\n"
-            "- send_data(): Send network data\n"
-            "- receive_data(): Receive network data";
+        let network_help = "Network Commands:\n- create_socket(): Create network socket\n- bind_socket(): Bind to address\n- connect_socket(): Connect to remote\n- send_data(): Send network data\n- receive_data(): Receive network data";
         return ResponseType::Text(network_help.to_string());
     }
     
     // Security queries
     if prompt_lower.contains("security") {
         let security_info = format!(
-            "Security Status:\n"
-            "- Sandbox: Enabled\n"
-            "- Current PID: {}\n"
-            "- Permissions: Process-based\n"
-            "- Memory protection: Active",
+            "Security Status:\n- Sandbox: Enabled\n- Current PID: {}\n- Permissions: Process-based\n- Memory protection: Active",
             crate::process::get_current_process_id()
         );
         return ResponseType::SystemInfo(security_info);
@@ -172,12 +142,7 @@ fn match_response_pattern(prompt: &str) -> ResponseType {
     
     // Error/debugging queries
     if prompt_lower.contains("error") || prompt_lower.contains("debug") {
-        let debug_help = "Debugging Help:\n"
-            "- Check system logs for errors\n"
-            "- Verify process permissions\n"
-            "- Check memory allocation\n"
-            "- Validate file paths\n"
-            "- Test network connectivity";
+        let debug_help = "Debugging Help:\n- Check system logs for errors\n- Verify process permissions\n- Check memory allocation\n- Validate file paths\n- Test network connectivity";
         return ResponseType::Text(debug_help.to_string());
     }
     
@@ -188,13 +153,7 @@ fn match_response_pattern(prompt: &str) -> ResponseType {
     
     // Default response
     ResponseType::Text(
-        "I'm the RaeenOS kernel assistant. I can help with:\n"
-        "- System information and status\n"
-        "- Process and memory management\n"
-        "- File system operations\n"
-        "- Network configuration\n"
-        "- Security and debugging\n"
-        "\nTry asking 'help' for more specific commands.".to_string()
+        "I'm the RaeenOS kernel assistant. I can help with:\n- System information and status\n- Process and memory management\n- File system operations\n- Network configuration\n- Security and debugging\n\nTry asking 'help' for more specific commands.".to_string()
     )
 }
 
@@ -204,14 +163,14 @@ pub fn create_session() -> Result<u32, ()> {
     let current_pid = crate::process::get_current_process_id();
     
     // Check permission
-    if !crate::security::request_permission(current_pid, "assistant.access").unwrap_or(false) {
+    if !crate::security::request_permission(current_pid as u32, "assistant.access").unwrap_or(false) {
         return Err(());
     }
     
     let session_id = assistant.next_session_id;
     assistant.next_session_id += 1;
     
-    let context = AssistantContext::new(session_id, current_pid);
+    let context = AssistantContext::new(session_id, current_pid as u32);
     assistant.sessions.insert(session_id, context);
     
     Ok(session_id)
@@ -232,7 +191,7 @@ pub fn generate_ai_response_with_session(session_id: u32, prompt: &str) -> Resul
         .ok_or(())?;
     
     // Check ownership
-    if context.process_id != current_pid {
+    if context.process_id != current_pid as u32 {
         return Err(());
     }
     
@@ -255,7 +214,7 @@ pub fn analyze_content(data: &str) -> Result<Vec<u8>, ()> {
     let current_pid = crate::process::get_current_process_id();
     
     // Check permission
-    if !crate::security::request_permission(current_pid, "assistant.analyze").unwrap_or(false) {
+    if !crate::security::request_permission(current_pid as u32, "assistant.analyze").unwrap_or(false) {
         return Err(());
     }
     
@@ -305,10 +264,10 @@ pub fn get_session_history(session_id: u32) -> Result<Vec<(String, String)>, ()>
         .ok_or(())?;
     
     // Check ownership
-    if context.process_id != current_pid {
+    if context.process_id != current_pid as u32 {
         return Err(());
     }
-    
+
     Ok(context.conversation_history.clone())
 }
 
@@ -321,10 +280,10 @@ pub fn close_session(session_id: u32) -> Result<(), ()> {
         .ok_or(())?;
     
     // Check ownership
-    if context.process_id != current_pid {
+    if context.process_id != current_pid as u32 {
         return Err(());
     }
-    
+
     assistant.sessions.remove(&session_id);
     Ok(())
 }

@@ -1,5 +1,5 @@
 use alloc::collections::BTreeMap;
-use alloc::string::String;
+use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use alloc::boxed::Box;
 use core::fmt;
@@ -90,7 +90,6 @@ impl fmt::Display for DeviceError {
 pub type DeviceResult<T> = Result<T, DeviceError>;
 
 // Device Manager
-#[derive(Debug)]
 pub struct DeviceManager {
     devices: BTreeMap<u64, Box<dyn Device>>,
     next_id: u64,
@@ -292,12 +291,12 @@ impl AtaDriver {
     
     fn identify_drive(&self, base: u16, is_master: bool) -> Option<AtaDrive> {
         unsafe {
-            let mut drive_port = Port::new(base + 6);
-            let mut command_port = Port::new(base + 7);
-            let mut status_port = Port::new(base + 7);
+            let mut drive_port: Port<u8> = Port::new(base + 6);
+            let mut command_port: Port<u8> = Port::new(base + 7);
+            let mut status_port: Port<u8> = Port::new(base + 7);
             
             // Select drive
-            drive_port.write(if is_master { 0xA0 } else { 0xB0 });
+            drive_port.write(if is_master { 0xA0u8 } else { 0xB0u8 });
             
             // Send IDENTIFY command
             command_port.write(0xECu8);
@@ -338,15 +337,15 @@ impl AtaDriver {
         let base = drive_info.base_port;
         
         unsafe {
-            let mut features_port = Port::new(base + 1);
-            let mut sector_count_port = Port::new(base + 2);
-            let mut lba_low_port = Port::new(base + 3);
-            let mut lba_mid_port = Port::new(base + 4);
-            let mut lba_high_port = Port::new(base + 5);
-            let mut drive_port = Port::new(base + 6);
-            let mut command_port = Port::new(base + 7);
-            let mut status_port = Port::new(base + 7);
-            let mut data_port = Port::new(base);
+            let mut features_port: Port<u8> = Port::new(base + 1);
+            let mut sector_count_port: Port<u8> = Port::new(base + 2);
+            let mut lba_low_port: Port<u8> = Port::new(base + 3);
+            let mut lba_mid_port: Port<u8> = Port::new(base + 4);
+            let mut lba_high_port: Port<u8> = Port::new(base + 5);
+            let mut drive_port: Port<u8> = Port::new(base + 6);
+            let mut command_port: Port<u8> = Port::new(base + 7);
+            let mut status_port: Port<u8> = Port::new(base + 7);
+            let mut data_port: Port<u16> = Port::new(base);
             
             // Set up LBA addressing
             features_port.write(0u8);
@@ -394,15 +393,15 @@ impl AtaDriver {
         let base = drive_info.base_port;
         
         unsafe {
-            let mut features_port = Port::new(base + 1);
-            let mut sector_count_port = Port::new(base + 2);
-            let mut lba_low_port = Port::new(base + 3);
-            let mut lba_mid_port = Port::new(base + 4);
-            let mut lba_high_port = Port::new(base + 5);
-            let mut drive_port = Port::new(base + 6);
-            let mut command_port = Port::new(base + 7);
-            let mut status_port = Port::new(base + 7);
-            let mut data_port = Port::new(base);
+            let mut features_port: Port<u8> = Port::new(base + 1);
+            let mut sector_count_port: Port<u8> = Port::new(base + 2);
+            let mut lba_low_port: Port<u8> = Port::new(base + 3);
+            let mut lba_mid_port: Port<u8> = Port::new(base + 4);
+            let mut lba_high_port: Port<u8> = Port::new(base + 5);
+            let mut drive_port: Port<u8> = Port::new(base + 6);
+            let mut command_port: Port<u8> = Port::new(base + 7);
+            let mut status_port: Port<u8> = Port::new(base + 7);
+            let mut data_port: Port<u16> = Port::new(base);
             
             // Set up LBA addressing
             features_port.write(0u8);

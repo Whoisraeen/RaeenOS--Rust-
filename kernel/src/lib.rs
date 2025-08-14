@@ -13,6 +13,7 @@ pub mod time;
 pub mod process;
 pub mod syscall;
 pub mod filesystem;
+pub use filesystem as fs;
 // pub mod drivers;
 // pub mod network;
 // pub mod ipc;

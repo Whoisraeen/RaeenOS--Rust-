@@ -3,6 +3,7 @@
 
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
+use alloc::vec;
 use alloc::boxed::Box;
 use spin::Mutex;
 use lazy_static::lazy_static;
@@ -206,7 +207,7 @@ pub fn create_pipe() -> Result<(u32, u32), ()> {
     let current_pid = crate::process::get_current_process_id();
     
     // Check permission
-    if !crate::security::request_permission(current_pid, "system.call").unwrap_or(false) {
+    if !crate::security::request_permission(current_pid as u32, "system.call").unwrap_or(false) {
         return Err(());
     }
     
@@ -229,7 +230,7 @@ pub fn create_pipe() -> Result<(u32, u32), ()> {
         object_type: IpcObjectType::Pipe,
         readable: true,
         writable: false,
-        process_id: current_pid,
+        process_id: current_pid as u32,
     });
     
     // Create write file descriptor
@@ -241,7 +242,7 @@ pub fn create_pipe() -> Result<(u32, u32), ()> {
         object_type: IpcObjectType::Pipe,
         readable: false,
         writable: true,
-        process_id: current_pid,
+        process_id: current_pid as u32,
     });
     
     Ok((read_fd, write_fd))
@@ -253,7 +254,7 @@ pub fn create_message_queue(max_messages: usize, max_message_size: usize) -> Res
     let current_pid = crate::process::get_current_process_id();
     
     // Check permission
-    if !crate::security::request_permission(current_pid, "system.call").unwrap_or(false) {
+    if !crate::security::request_permission(current_pid as u32, "system.call").unwrap_or(false) {
         return Err(());
     }
     
@@ -272,7 +273,7 @@ pub fn create_message_queue(max_messages: usize, max_message_size: usize) -> Res
         object_type: IpcObjectType::MessageQueue,
         readable: true,
         writable: true,
-        process_id: current_pid,
+        process_id: current_pid as u32,
     });
     
     Ok(fd)
@@ -284,7 +285,7 @@ pub fn create_shared_memory(size: usize) -> Result<u32, ()> {
     let current_pid = crate::process::get_current_process_id();
     
     // Check permission
-    if !crate::security::request_permission(current_pid, "system.call").unwrap_or(false) {
+    if !crate::security::request_permission(current_pid as u32, "system.call").unwrap_or(false) {
         return Err(());
     }
     
@@ -292,7 +293,7 @@ pub fn create_shared_memory(size: usize) -> Result<u32, ()> {
     ipc.next_ipc_id += 1;
     
     let mut shm = SharedMemory::new(size);
-    shm.attach(current_pid)?;
+    shm.attach(current_pid as u32)?;
     
     ipc.objects.insert(shm_id, IpcObject::SharedMemory(shm));
     
@@ -304,14 +305,18 @@ pub fn ipc_read(fd: u32, buf: &mut [u8]) -> Result<usize, ()> {
     let mut ipc = IPC_SYSTEM.lock();
     let current_pid = crate::process::get_current_process_id();
     
-    let file_desc = ipc.file_descriptors.get(&fd).ok_or(())?;
+    // Extract the necessary information from file descriptor first
+    let (ipc_id, process_id, readable) = {
+        let file_desc = ipc.file_descriptors.get(&fd).ok_or(())?;
+        (file_desc.ipc_id, file_desc.process_id, file_desc.readable)
+    };
     
     // Check ownership and permissions
-    if file_desc.process_id != current_pid || !file_desc.readable {
+    if process_id != current_pid as u32 || !readable {
         return Err(());
     }
     
-    match ipc.objects.get_mut(&file_desc.ipc_id).ok_or(())? {
+    match ipc.objects.get_mut(&ipc_id).ok_or(())? {
         IpcObject::Pipe(pipe) => pipe.read(buf),
         IpcObject::MessageQueue(queue) => {
             let message = queue.receive()?;
@@ -328,14 +333,19 @@ pub fn ipc_write(fd: u32, buf: &[u8]) -> Result<usize, ()> {
     let mut ipc = IPC_SYSTEM.lock();
     let current_pid = crate::process::get_current_process_id();
     
-    let file_desc = ipc.file_descriptors.get(&fd).ok_or(())?;
+    // Extract needed values before mutable operations
+    let ipc_id = {
+        let file_desc = ipc.file_descriptors.get(&fd).ok_or(())?;
+        
+        // Check ownership and permissions
+        if file_desc.process_id != current_pid as u32 || !file_desc.writable {
+            return Err(());
+        }
+        
+        file_desc.ipc_id
+    };
     
-    // Check ownership and permissions
-    if file_desc.process_id != current_pid || !file_desc.writable {
-        return Err(());
-    }
-    
-    match ipc.objects.get_mut(&file_desc.ipc_id).ok_or(())? {
+    match ipc.objects.get_mut(&ipc_id).ok_or(())? {
         IpcObject::Pipe(pipe) => pipe.write(buf),
         IpcObject::MessageQueue(queue) => {
             queue.send(buf)?;
@@ -350,25 +360,27 @@ pub fn close_ipc_fd(fd: u32) -> Result<(), ()> {
     let mut ipc = IPC_SYSTEM.lock();
     let current_pid = crate::process::get_current_process_id();
     
-    let file_desc = ipc.file_descriptors.get(&fd).ok_or(())?;
-    
-    // Check ownership
-    if file_desc.process_id != current_pid {
-        return Err(());
-    }
-    
-    let ipc_id = file_desc.ipc_id;
-    let object_type = file_desc.object_type;
+    // Extract needed values before mutable operations
+    let (ipc_id, object_type, readable, writable) = {
+        let file_desc = ipc.file_descriptors.get(&fd).ok_or(())?;
+        
+        // Check ownership
+        if file_desc.process_id != current_pid as u32 {
+            return Err(());
+        }
+        
+        (file_desc.ipc_id, file_desc.object_type, file_desc.readable, file_desc.writable)
+    };
     
     ipc.file_descriptors.remove(&fd);
     
     // Update reference counts for pipes
     if object_type == IpcObjectType::Pipe {
         if let Some(IpcObject::Pipe(pipe)) = ipc.objects.get_mut(&ipc_id) {
-            if file_desc.readable {
+            if readable {
                 pipe.readers = pipe.readers.saturating_sub(1);
             }
-            if file_desc.writable {
+            if writable {
                 pipe.writers = pipe.writers.saturating_sub(1);
             }
             
@@ -388,12 +400,12 @@ pub fn attach_shared_memory(shm_id: u32) -> Result<*mut u8, ()> {
     let current_pid = crate::process::get_current_process_id();
     
     // Check permission
-    if !crate::security::request_permission(current_pid, "system.call").unwrap_or(false) {
+    if !crate::security::request_permission(current_pid as u32, "system.call").unwrap_or(false) {
         return Err(());
     }
     
     if let Some(IpcObject::SharedMemory(shm)) = ipc.objects.get_mut(&shm_id) {
-        shm.attach(current_pid)?;
+        shm.attach(current_pid as u32)?;
         Ok(shm.data.as_mut_ptr())
     } else {
         Err(())
@@ -406,7 +418,7 @@ pub fn detach_shared_memory(shm_id: u32) -> Result<(), ()> {
     let current_pid = crate::process::get_current_process_id();
     
     if let Some(IpcObject::SharedMemory(shm)) = ipc.objects.get_mut(&shm_id) {
-        shm.detach(current_pid);
+        shm.detach(current_pid as u32);
         Ok(())
     } else {
         Err(())

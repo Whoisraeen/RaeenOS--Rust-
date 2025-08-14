@@ -2,6 +2,8 @@
 
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
+use alloc::vec;
+use alloc::format;
 use alloc::collections::BTreeMap;
 use spin::Mutex;
 use lazy_static::lazy_static;
@@ -36,7 +38,7 @@ pub enum AppType {
 }
 
 // Application framework capabilities
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum FrameworkCapability {
     Graphics2D,
     Graphics3D,
@@ -228,10 +230,10 @@ lazy_static! {
 
 // Initialize RaeKit framework
 pub fn init_raekit() -> Result<(), ()> {
-    let current_pid = crate::process::get_current_process_id();
+    let current_pid = crate::process::get_current_process_info().map(|(pid, _, _)| pid).unwrap_or(0);
     
     // Check permission
-    if !crate::security::request_permission(current_pid, "raekit.init").unwrap_or(false) {
+    if !crate::security::request_permission(current_pid as u32, "raekit.init").unwrap_or(false) {
         return Err(());
     }
     
@@ -246,10 +248,10 @@ pub fn init_raekit() -> Result<(), ()> {
 // Register an application
 pub fn register_application(app_info: AppInfo) -> Result<(), ()> {
     let mut raekit = RAEKIT_SYSTEM.lock();
-    let current_pid = crate::process::get_current_process_id();
+    let current_pid = crate::process::get_current_process_info().map(|(pid, _, _)| pid).unwrap_or(0);
     
     // Check permission
-    if !crate::security::request_permission(current_pid, "raekit.register").unwrap_or(false) {
+    if !crate::security::request_permission(current_pid as u32, "raekit.register").unwrap_or(false) {
         return Err(());
     }
     
@@ -260,10 +262,10 @@ pub fn register_application(app_info: AppInfo) -> Result<(), ()> {
 // Launch an application
 pub fn launch_application(app_name: &str, args: &[&str]) -> Result<u32, ()> {
     let mut raekit = RAEKIT_SYSTEM.lock();
-    let current_pid = crate::process::get_current_process_id();
+    let current_pid = crate::process::get_current_process_info().map(|(pid, _, _)| pid).unwrap_or(0);
     
     // Check permission
-    if !crate::security::request_permission(current_pid, "raekit.launch").unwrap_or(false) {
+    if !crate::security::request_permission(current_pid as u32, "raekit.launch").unwrap_or(false) {
         return Err(());
     }
     
@@ -274,22 +276,27 @@ pub fn launch_application(app_name: &str, args: &[&str]) -> Result<u32, ()> {
     
     // Check application permissions
     for permission in &app_info.permissions {
-        if !crate::security::request_permission(current_pid, permission).unwrap_or(false) {
+        if !crate::security::request_permission(current_pid as u32, permission).unwrap_or(false) {
             return Err(());
         }
     }
     
-    // Launch process
-    let process_id = crate::process::exec_process(&app_info.executable_path, args)
-        .map_err(|_| ())?;
+    // Launch process - exec_process returns Result<(), ()>, so we need to create a new process instead
+    // For now, we'll use the current process ID as a placeholder
+    // In a real implementation, we would fork and then exec
+    let current_pid = crate::process::get_current_process_info().map(|(pid, _, _)| pid).unwrap_or(0);
     
+    // Try to execute the process
+    crate::process::exec_process(&app_info.executable_path, args)
+        .map_err(|_| ())?;
+
     // Create application context
     let app_id = raekit.next_app_id;
     raekit.next_app_id += 1;
-    
+
     let context = AppContext {
         app_id,
-        process_id,
+        process_id: current_pid as u32,
         state: AppState::Starting,
         capabilities: Vec::new(),
         resource_limits: ResourceLimits::default(),
@@ -312,10 +319,10 @@ pub fn launch_application(app_name: &str, args: &[&str]) -> Result<u32, ()> {
 // Stop an application
 pub fn stop_application(app_id: u32) -> Result<(), ()> {
     let mut raekit = RAEKIT_SYSTEM.lock();
-    let current_pid = crate::process::get_current_process_id();
+    let current_pid = crate::process::get_current_process_info().map(|(pid, _, _)| pid).unwrap_or(0);
     
     // Check permission
-    if !crate::security::request_permission(current_pid, "raekit.stop").unwrap_or(false) {
+    if !crate::security::request_permission(current_pid as u32, "raekit.stop").unwrap_or(false) {
         return Err(());
     }
     
@@ -324,7 +331,7 @@ pub fn stop_application(app_id: u32) -> Result<(), ()> {
         .ok_or(())?;
     
     // Terminate process
-    let _ = crate::process::terminate_process(context.process_id);
+    let _ = crate::process::terminate_process(context.process_id as u64);
     
     // Update state
     context.state = AppState::Stopping;
@@ -338,10 +345,10 @@ pub fn stop_application(app_id: u32) -> Result<(), ()> {
 // Get application information
 pub fn get_application_info(app_name: &str) -> Result<Option<AppInfo>, ()> {
     let raekit = RAEKIT_SYSTEM.lock();
-    let current_pid = crate::process::get_current_process_id();
+    let current_pid = crate::process::get_current_process_info().map(|(pid, _, _)| pid).unwrap_or(0);
     
     // Check permission
-    if !crate::security::request_permission(current_pid, "raekit.info").unwrap_or(false) {
+    if !crate::security::request_permission(current_pid as u32, "raekit.info").unwrap_or(false) {
         return Err(());
     }
     
@@ -351,10 +358,10 @@ pub fn get_application_info(app_name: &str) -> Result<Option<AppInfo>, ()> {
 // List all registered applications
 pub fn list_applications() -> Result<Vec<AppInfo>, ()> {
     let raekit = RAEKIT_SYSTEM.lock();
-    let current_pid = crate::process::get_current_process_id();
+    let current_pid = crate::process::get_current_process_info().map(|(pid, _, _)| pid).unwrap_or(0);
     
     // Check permission
-    if !crate::security::request_permission(current_pid, "raekit.list").unwrap_or(false) {
+    if !crate::security::request_permission(current_pid as u32, "raekit.list").unwrap_or(false) {
         return Err(());
     }
     
@@ -364,10 +371,10 @@ pub fn list_applications() -> Result<Vec<AppInfo>, ()> {
 // List running applications
 pub fn list_running_applications() -> Result<Vec<(u32, String, AppState)>, ()> {
     let raekit = RAEKIT_SYSTEM.lock();
-    let current_pid = crate::process::get_current_process_id();
+    let current_pid = crate::process::get_current_process_info().map(|(pid, _, _)| pid).unwrap_or(0);
     
     // Check permission
-    if !crate::security::request_permission(current_pid, "raekit.status").unwrap_or(false) {
+    if !crate::security::request_permission(current_pid as u32, "raekit.status").unwrap_or(false) {
         return Err(());
     }
     
@@ -392,10 +399,10 @@ pub fn list_running_applications() -> Result<Vec<(u32, String, AppState)>, ()> {
 // Create a new development project
 pub fn create_project(name: &str, path: &str, template: &str) -> Result<(), ()> {
     let mut raekit = RAEKIT_SYSTEM.lock();
-    let current_pid = crate::process::get_current_process_id();
+    let current_pid = crate::process::get_current_process_info().map(|(pid, _, _)| pid).unwrap_or(0);
     
     // Check permission
-    if !crate::security::request_permission(current_pid, "raekit.develop").unwrap_or(false) {
+    if !crate::security::request_permission(current_pid as u32, "raekit.develop").unwrap_or(false) {
         return Err(());
     }
     
@@ -464,10 +471,10 @@ pub fn create_project(name: &str, path: &str, template: &str) -> Result<(), ()> 
 // Build a project
 pub fn build_project(project_name: &str) -> Result<String, ()> {
     let mut raekit = RAEKIT_SYSTEM.lock();
-    let current_pid = crate::process::get_current_process_id();
+    let current_pid = crate::process::get_current_process_info().map(|(pid, _, _)| pid).unwrap_or(0);
     
     // Check permission
-    if !crate::security::request_permission(current_pid, "raekit.build").unwrap_or(false) {
+    if !crate::security::request_permission(current_pid as u32, "raekit.build").unwrap_or(false) {
         return Err(());
     }
     
@@ -487,10 +494,10 @@ pub fn build_project(project_name: &str) -> Result<String, ()> {
 // Get project information
 pub fn get_project_info(project_name: &str) -> Result<Option<DevProject>, ()> {
     let raekit = RAEKIT_SYSTEM.lock();
-    let current_pid = crate::process::get_current_process_id();
+    let current_pid = crate::process::get_current_process_info().map(|(pid, _, _)| pid).unwrap_or(0);
     
     // Check permission
-    if !crate::security::request_permission(current_pid, "raekit.project.info").unwrap_or(false) {
+    if !crate::security::request_permission(current_pid as u32, "raekit.project.info").unwrap_or(false) {
         return Err(());
     }
     
@@ -500,10 +507,10 @@ pub fn get_project_info(project_name: &str) -> Result<Option<DevProject>, ()> {
 // List development projects
 pub fn list_projects() -> Result<Vec<DevProject>, ()> {
     let raekit = RAEKIT_SYSTEM.lock();
-    let current_pid = crate::process::get_current_process_id();
+    let current_pid = crate::process::get_current_process_info().map(|(pid, _, _)| pid).unwrap_or(0);
     
     // Check permission
-    if !crate::security::request_permission(current_pid, "raekit.project.list").unwrap_or(false) {
+    if !crate::security::request_permission(current_pid as u32, "raekit.project.list").unwrap_or(false) {
         return Err(());
     }
     
@@ -513,10 +520,10 @@ pub fn list_projects() -> Result<Vec<DevProject>, ()> {
 // Get available templates
 pub fn get_available_templates() -> Result<Vec<(String, String)>, ()> {
     let raekit = RAEKIT_SYSTEM.lock();
-    let current_pid = crate::process::get_current_process_id();
+    let current_pid = crate::process::get_current_process_info().map(|(pid, _, _)| pid).unwrap_or(0);
     
     // Check permission
-    if !crate::security::request_permission(current_pid, "raekit.templates").unwrap_or(false) {
+    if !crate::security::request_permission(current_pid as u32, "raekit.templates").unwrap_or(false) {
         return Err(());
     }
     
@@ -531,10 +538,10 @@ pub fn get_available_templates() -> Result<Vec<(String, String)>, ()> {
 // Get build tools
 pub fn get_build_tools() -> Result<Vec<(String, String)>, ()> {
     let raekit = RAEKIT_SYSTEM.lock();
-    let current_pid = crate::process::get_current_process_id();
+    let current_pid = crate::process::get_current_process_info().map(|(pid, _, _)| pid).unwrap_or(0);
     
     // Check permission
-    if !crate::security::request_permission(current_pid, "raekit.tools").unwrap_or(false) {
+    if !crate::security::request_permission(current_pid as u32, "raekit.tools").unwrap_or(false) {
         return Err(());
     }
     
@@ -549,10 +556,10 @@ pub fn get_build_tools() -> Result<Vec<(String, String)>, ()> {
 // Set resource limits for an application
 pub fn set_resource_limits(app_id: u32, limits: ResourceLimits) -> Result<(), ()> {
     let mut raekit = RAEKIT_SYSTEM.lock();
-    let current_pid = crate::process::get_current_process_id();
+    let current_pid = crate::process::get_current_process_info().map(|(pid, _, _)| pid).unwrap_or(0);
     
     // Check permission
-    if !crate::security::request_permission(current_pid, "raekit.limits").unwrap_or(false) {
+    if !crate::security::request_permission(current_pid as u32, "raekit.limits").unwrap_or(false) {
         return Err(());
     }
     
@@ -567,10 +574,10 @@ pub fn set_resource_limits(app_id: u32, limits: ResourceLimits) -> Result<(), ()
 // Get application resource usage
 pub fn get_resource_usage(app_id: u32) -> Result<(u64, f32), ()> {
     let raekit = RAEKIT_SYSTEM.lock();
-    let current_pid = crate::process::get_current_process_id();
+    let current_pid = crate::process::get_current_process_info().map(|(pid, _, _)| pid).unwrap_or(0);
     
     // Check permission
-    if !crate::security::request_permission(current_pid, "raekit.monitor").unwrap_or(false) {
+    if !crate::security::request_permission(current_pid as u32, "raekit.monitor").unwrap_or(false) {
         return Err(());
     }
     
@@ -587,7 +594,7 @@ pub fn enable_capability(app_id: u32, capability: FrameworkCapability) -> Result
     let current_pid = crate::process::get_current_process_id();
     
     // Check permission
-    if !crate::security::request_permission(current_pid, "raekit.capability").unwrap_or(false) {
+    if !crate::security::request_permission(current_pid as u32, "raekit.capability").unwrap_or(false) {
         return Err(());
     }
     

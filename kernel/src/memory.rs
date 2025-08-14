@@ -1,5 +1,5 @@
 use x86_64::{PhysAddr, VirtAddr};
-use x86_64::structures::paging::{OffsetPageTable, PageTable, PhysFrame, FrameAllocator, Size4KiB};
+use x86_64::structures::paging::{OffsetPageTable, PageTable, PhysFrame, FrameAllocator, Size4KiB, Mapper, Page, PageTableFlags};
 use spin::Mutex;
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -89,7 +89,6 @@ pub fn virt_to_phys(virt_addr: VirtAddr) -> PhysAddr {
     PhysAddr::new(virt_addr.as_u64() - active_physical_offset())
 }
 
-use spin::Mutex;
 use lazy_static::lazy_static;
 
 // Memory statistics tracking
@@ -124,8 +123,8 @@ pub fn set_program_break(addr: VirtAddr) -> Result<VirtAddr, ()> {
         let pages_to_unmap = (current_break.as_u64() - addr.as_u64()) / 4096;
         
         // Get current process for permission checking
-        let current_pid = crate::process::get_current_process_id();
-        if !crate::security::request_permission(current_pid, "memory.alloc").unwrap_or(false) {
+        let current_pid = crate::process::get_current_process_info().map(|(pid, _, _)| pid).unwrap_or(0);
+        if !crate::security::request_permission(current_pid.try_into().unwrap_or(0), "memory.alloc").unwrap_or(false) {
             return Err(());
         }
         
@@ -133,11 +132,9 @@ pub fn set_program_break(addr: VirtAddr) -> Result<VirtAddr, ()> {
         with_mapper(|mapper| {
             let mut current_addr = addr;
             while current_addr < current_break {
-                if let Ok((frame, _)) = mapper.translate_page(Page::containing_address(current_addr)) {
-                    let _ = mapper.unmap(Page::containing_address(current_addr));
-                    with_frame_allocator(|allocator| {
-                        allocator.deallocate_frame(frame);
-                    });
+                if let Ok(_frame) = mapper.translate_page(Page::<Size4KiB>::containing_address(current_addr)) {
+                    let _ = mapper.unmap(Page::<Size4KiB>::containing_address(current_addr));
+                    // TODO: Implement frame deallocation
                 }
                 current_addr += 4096u64;
             }
@@ -150,8 +147,8 @@ pub fn set_program_break(addr: VirtAddr) -> Result<VirtAddr, ()> {
         let pages_to_map = (addr.as_u64() - current_break.as_u64()) / 4096;
         
         // Check memory allocation permission
-        let current_pid = crate::process::get_current_process_id();
-        if !crate::security::request_permission(current_pid, "memory.alloc").unwrap_or(false) {
+        let current_pid = crate::process::get_current_process_info().map(|(pid, _, _)| pid).unwrap_or(0);
+        if !crate::security::request_permission(current_pid.try_into().unwrap_or(0), "memory.alloc").unwrap_or(false) {
             return Err(());
         }
         
@@ -167,9 +164,9 @@ pub fn set_program_break(addr: VirtAddr) -> Result<VirtAddr, ()> {
                 let mut current_addr = current_break;
                 while current_addr < addr {
                     let page = Page::containing_address(current_addr);
-                    if let Ok(frame) = allocator.allocate_frame() {
+                    if let Some(frame) = allocator.allocate_frame() {
                         let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
-                        if mapper.map_to(page, frame, flags, allocator).is_ok() {
+                        if unsafe { mapper.map_to(page, frame, flags, allocator) }.is_ok() {
                             // Zero the page for security
                             unsafe {
                                 let page_ptr = current_addr.as_mut_ptr::<u8>();

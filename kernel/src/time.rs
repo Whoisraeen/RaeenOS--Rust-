@@ -168,6 +168,10 @@ pub fn get_uptime_seconds() -> u64 {
     get_uptime_ms() / 1000
 }
 
+pub fn get_system_uptime() -> u64 {
+    get_uptime_seconds()
+}
+
 pub fn get_datetime() -> DateTime {
     // For now, just read from RTC each time
     // In a real implementation, we'd maintain this in memory

@@ -1,0 +1,17 @@
+mix_id: std-app-mix-v1
+desktop:
+  processes:
+    - {name: "RaeUI+compositor", workload: "idle + window-move every 5s"}
+    - {name: "Browser", tabs: 10, media: "1x 1080p60"}
+    - {name: "Filesync", state: "idle"}
+    - {name: "Editor", project: "rae-sample"}
+laptop:
+  extras:
+    - {name: "Wi-Fi roam", interval_s: "120–300", constraint: "no audio underruns"}
+datasets:
+  browser_cache_mb: 512
+  file_io_hotset_mb: 256
+timings:
+  warmup_s: 45
+  duration_s: 600
+

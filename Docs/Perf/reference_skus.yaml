@@ -1,0 +1,19 @@
+skus:
+  - id: desk-sku-a
+    cpu: "Ryzen 7 7700X (8C/16T)"
+    ram_gb: 32
+    nvme: "PCIe4 x4, 1TB"
+    nic:  "Intel i225-V"
+    gpu:  "RX 6800"
+  - id: lap-sku-b
+    cpu: "Intel i7-1360P (12C)"
+    ram_gb: 16
+    nvme: "PCIe4 x4, 512GB"
+    nic:  "AX211 Wi-Fi 6E"
+    igpu: "Xe iGPU"
+  - id: srv-sku-c
+    cpu: "EPYC 7543 (32C)"
+    ram_gb: 128
+    nvme: "U.2 PCIe4"
+    nic:  "ConnectX-5 25GbE"
+

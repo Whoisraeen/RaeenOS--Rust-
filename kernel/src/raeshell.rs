@@ -2,6 +2,7 @@
 
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
+use alloc::format;
 use alloc::collections::BTreeMap;
 use spin::Mutex;
 use lazy_static::lazy_static;
@@ -111,31 +112,7 @@ lazy_static! {
 
 // Built-in command implementations
 fn cmd_help(_args: &[&str]) -> ShellResult {
-    let help_text = "RaeShell - Built-in Commands:\n"
-        "  help        - Show this help message\n"
-        "  ls [path]   - List directory contents\n"
-        "  cd <path>   - Change directory\n"
-        "  pwd         - Print working directory\n"
-        "  echo <text> - Print text to output\n"
-        "  env         - Show environment variables\n"
-        "  export K=V  - Set environment variable\n"
-        "  history     - Show command history\n"
-        "  clear       - Clear screen\n"
-        "  ps          - List running processes\n"
-        "  kill <pid>  - Terminate process\n"
-        "  cat <file>  - Display file contents\n"
-        "  touch <file>- Create empty file\n"
-        "  rm <file>   - Remove file\n"
-        "  mkdir <dir> - Create directory\n"
-        "  rmdir <dir> - Remove directory\n"
-        "  cp <src> <dst> - Copy file\n"
-        "  mv <src> <dst> - Move/rename file\n"
-        "  exit        - Exit shell\n"
-        "  uname       - System information\n"
-        "  whoami      - Current user\n"
-        "  date        - Current date/time\n"
-        "  uptime      - System uptime\n"
-        "  free        - Memory usage";
+    let help_text = "RaeShell - Built-in Commands:\n  help        - Show this help message\n  ls [path]   - List directory contents\n  cd <path>   - Change directory\n  pwd         - Print working directory\n  echo <text> - Print text to output\n  env         - Show environment variables\n  export K=V  - Set environment variable\n  history     - Show command history\n  clear       - Clear screen\n  ps          - List running processes\n  kill <pid>  - Terminate process\n  cat <file>  - Display file contents\n  touch <file>- Create empty file\n  rm <file>   - Remove file\n  mkdir <dir> - Create directory\n  rmdir <dir> - Remove directory\n  cp <src> <dst> - Copy file\n  mv <src> <dst> - Move/rename file\n  exit        - Exit shell\n  uname       - System information\n  whoami      - Current user\n  date        - Current date/time\n  uptime      - System uptime\n  free        - Memory usage";
     
     ShellResult::Success(help_text.to_string())
 }
@@ -144,7 +121,7 @@ fn cmd_ls(args: &[&str]) -> ShellResult {
     let path = if args.len() > 1 { args[1] } else { "." };
     
     // Use VFS to list directory
-    match crate::fs::list_directory(path) {
+    match crate::filesystem::list_directory(path) {
         Ok(entries) => {
             let mut output = String::new();
             for entry in entries {
@@ -165,9 +142,9 @@ fn cmd_cd(args: &[&str]) -> ShellResult {
     let path = args[1];
     
     // Validate path exists
-    match crate::fs::get_metadata(path) {
+    match crate::fs::metadata(path) {
         Ok(metadata) => {
-            if metadata.is_directory {
+            if metadata.file_type == crate::filesystem::FileType::Directory {
                 // Update current directory in session
                 // This would need session context
                 ShellResult::Success(String::new())
@@ -195,10 +172,7 @@ fn cmd_echo(args: &[&str]) -> ShellResult {
 
 fn cmd_env(_args: &[&str]) -> ShellResult {
     // This would get environment from session
-    let env_output = "PATH=/bin:/usr/bin:/usr/local/bin\n"
-        "HOME=/home/user\n"
-        "USER=user\n"
-        "SHELL=/bin/raeshell";
+    let env_output = "PATH=/bin:/usr/bin:/usr/local/bin\nHOME=/home/user\nUSER=user\nSHELL=/bin/raeshell";
     
     ShellResult::Success(env_output.to_string())
 }
@@ -236,9 +210,7 @@ fn cmd_ps(_args: &[&str]) -> ShellResult {
     let current_pid = crate::process::get_current_process_id();
     
     let output = format!(
-        "PID  COMMAND\n"
-        "{}   raeshell\n"
-        "Total processes: {}",
+        "PID  COMMAND\n{}   raeshell\nTotal processes: {}",
         current_pid,
         process_count
     );
@@ -251,11 +223,9 @@ fn cmd_kill(args: &[&str]) -> ShellResult {
         return ShellResult::Error("kill: missing argument".to_string());
     }
     
-    if let Ok(pid) = args[1].parse::<u32>() {
-        match crate::process::terminate_process(pid) {
-            Ok(_) => ShellResult::Success(format!("Process {} terminated", pid)),
-            Err(_) => ShellResult::Error(format!("kill: process {} not found", pid)),
-        }
+    if let Ok(pid) = args[1].parse::<u64>() {
+        crate::process::terminate_process(pid);
+        ShellResult::Success(format!("Process {} terminated", pid))
     } else {
         ShellResult::Error("kill: invalid process ID".to_string())
     }
@@ -270,7 +240,7 @@ fn cmd_cat(args: &[&str]) -> ShellResult {
     
     match crate::fs::open_file(filename) {
         Ok(fd) => {
-            match crate::fs::read_file(fd, 4096) {
+            match crate::fs::read_file_fd(fd, 4096) {
                 Ok(data) => {
                     let _ = crate::fs::close_file(fd);
                     match String::from_utf8(data) {
@@ -308,7 +278,7 @@ fn cmd_rm(args: &[&str]) -> ShellResult {
     
     let filename = args[1];
     
-    match crate::fs::remove_file(filename) {
+    match crate::fs::remove(filename) {
         Ok(_) => ShellResult::Success(String::new()),
         Err(_) => ShellResult::Error(format!("rm: cannot remove '{}'", filename)),
     }
@@ -334,7 +304,7 @@ fn cmd_rmdir(args: &[&str]) -> ShellResult {
     
     let dirname = args[1];
     
-    match crate::fs::remove_directory(dirname) {
+    match crate::fs::remove(dirname) {
         Ok(_) => ShellResult::Success(String::new()),
         Err(_) => ShellResult::Error(format!("rmdir: cannot remove directory '{}'", dirname)),
     }
@@ -351,22 +321,27 @@ fn cmd_cp(args: &[&str]) -> ShellResult {
     // Read source file
     match crate::fs::open_file(src) {
         Ok(src_fd) => {
-            match crate::fs::read_file(src_fd, 65536) {
+            match crate::fs::read_file_fd(src_fd, 65536) {
                 Ok(data) => {
                     let _ = crate::fs::close_file(src_fd);
                     
                     // Write to destination
                     match crate::fs::create_file(dst) {
-                        Ok(dst_fd) => {
-                            match crate::fs::write_file(dst_fd, &data) {
-                                Ok(_) => {
-                                    let _ = crate::fs::close_file(dst_fd);
-                                    ShellResult::Success(String::new())
+                        Ok(()) => {
+                            match crate::fs::open_file(dst) {
+                                Ok(dst_fd) => {
+                                    match crate::fs::write_file(dst_fd, &data) {
+                                        Ok(_) => {
+                                            let _ = crate::fs::close_file(dst_fd);
+                                            ShellResult::Success(String::new())
+                                        }
+                                        Err(_) => {
+                                            let _ = crate::fs::close_file(dst_fd);
+                                            ShellResult::Error(format!("cp: cannot write to '{}'", dst))
+                                        }
+                                    }
                                 }
-                                Err(_) => {
-                                    let _ = crate::fs::close_file(dst_fd);
-                                    ShellResult::Error(format!("cp: cannot write to '{}'", dst))
-                                }
+                                Err(_) => ShellResult::Error(format!("cp: cannot open '{}' for writing", dst)),
                             }
                         }
                         Err(_) => ShellResult::Error(format!("cp: cannot create '{}'", dst)),
@@ -393,7 +368,7 @@ fn cmd_mv(args: &[&str]) -> ShellResult {
     // Copy then remove source
     match cmd_cp(&["cp", src, dst]) {
         ShellResult::Success(_) => {
-            match crate::fs::remove_file(src) {
+            match crate::fs::remove(src) {
                 Ok(_) => ShellResult::Success(String::new()),
                 Err(_) => ShellResult::Error(format!("mv: cannot remove '{}'", src)),
             }
@@ -434,10 +409,7 @@ fn cmd_free(_args: &[&str]) -> ShellResult {
     let used = total - free;
     
     let output = format!(
-        "              total        used        free\n"
-        "Mem:    {:10} {:10} {:10}\n"
-        "\n"
-        "Memory usage: {:.1}%",
+        "              total        used        free\nMem:    {:10} {:10} {:10}\n\nMemory usage: {:.1}%",
         total / 1024,
         used / 1024,
         free / 1024,
@@ -458,14 +430,14 @@ pub fn create_shell_session() -> Result<u32, ()> {
     let current_pid = crate::process::get_current_process_id();
     
     // Check permission
-    if !crate::security::request_permission(current_pid, "shell.access").unwrap_or(false) {
+    if !crate::security::request_permission(current_pid as u32, "shell.access").unwrap_or(false) {
         return Err(());
     }
     
     let session_id = shell.next_session_id;
     shell.next_session_id += 1;
     
-    let session = ShellSession::new(session_id, current_pid);
+    let session = ShellSession::new(session_id, current_pid as u32);
     shell.sessions.insert(session_id, session);
     
     Ok(session_id)
@@ -480,7 +452,7 @@ pub fn execute_command(session_id: u32, command_line: &str) -> Result<ShellResul
         .ok_or(())?;
     
     // Check ownership
-    if session.process_id != current_pid {
+    if u64::from(session.process_id) != current_pid {
         return Err(());
     }
     
@@ -501,18 +473,9 @@ pub fn execute_command(session_id: u32, command_line: &str) -> Result<ShellResul
     } else {
         // Try to execute as external program
         match crate::process::exec_process(command, &tokens[1..]) {
-            Ok(pid) => {
-                // Wait for process to complete
-                match crate::process::wait_for_process(pid) {
-                    Ok(exit_code) => {
-                        if exit_code == 0 {
-                            Ok(ShellResult::Success(String::new()))
-                        } else {
-                            Ok(ShellResult::Error(format!("Process exited with code {}", exit_code)))
-                        }
-                    }
-                    Err(_) => Ok(ShellResult::Error("Process execution failed".to_string())),
-                }
+            Ok(()) => {
+                // exec replaces current process, so this shouldn't normally return
+                Ok(ShellResult::Success(String::new()))
             }
             Err(_) => Ok(ShellResult::Error(format!("{}: command not found", command))),
         }
@@ -528,7 +491,7 @@ pub fn get_shell_prompt(session_id: u32) -> Result<String, ()> {
         .ok_or(())?;
     
     // Check ownership
-    if session.process_id != current_pid {
+    if u64::from(session.process_id) != current_pid {
         return Err(());
     }
     
@@ -544,10 +507,10 @@ pub fn get_current_directory(session_id: u32) -> Result<String, ()> {
         .ok_or(())?;
     
     // Check ownership
-    if session.process_id != current_pid {
+    if u64::from(session.process_id) != current_pid {
         return Err(());
     }
-    
+
     Ok(session.current_directory.clone())
 }
 
@@ -560,10 +523,10 @@ pub fn set_current_directory(session_id: u32, path: &str) -> Result<(), ()> {
         .ok_or(())?;
     
     // Check ownership
-    if session.process_id != current_pid {
+    if u64::from(session.process_id) != current_pid {
         return Err(());
     }
-    
+
     session.current_directory = path.to_string();
     Ok(())
 }
@@ -577,7 +540,7 @@ pub fn get_environment_variable(session_id: u32, key: &str) -> Result<Option<Str
         .ok_or(())?;
     
     // Check ownership
-    if session.process_id != current_pid {
+    if u64::from(session.process_id) != current_pid {
         return Err(());
     }
     
@@ -593,7 +556,7 @@ pub fn set_environment_variable(session_id: u32, key: &str, value: &str) -> Resu
         .ok_or(())?;
     
     // Check ownership
-    if session.process_id != current_pid {
+    if u64::from(session.process_id) != current_pid {
         return Err(());
     }
     
@@ -610,10 +573,10 @@ pub fn get_command_history(session_id: u32) -> Result<Vec<String>, ()> {
         .ok_or(())?;
     
     // Check ownership
-    if session.process_id != current_pid {
+    if u64::from(session.process_id) != current_pid {
         return Err(());
     }
-    
+
     Ok(session.command_history.clone())
 }
 
@@ -626,7 +589,7 @@ pub fn close_shell_session(session_id: u32) -> Result<(), ()> {
         .ok_or(())?;
     
     // Check ownership
-    if session.process_id != current_pid {
+    if u64::from(session.process_id) != current_pid {
         return Err(());
     }
     

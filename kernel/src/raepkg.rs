@@ -2,6 +2,7 @@
 
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
+use alloc::format;
 use alloc::collections::BTreeMap;
 use spin::Mutex;
 use lazy_static::lazy_static;
@@ -193,7 +194,7 @@ pub fn init_package_system() -> Result<(), ()> {
     let current_pid = crate::process::get_current_process_id();
     
     // Check permission
-    if !crate::security::request_permission(current_pid, "package.manage").unwrap_or(false) {
+    if !crate::security::request_permission(current_pid as u32, "package.manage").unwrap_or(false) {
         return Err(());
     }
     
@@ -210,7 +211,7 @@ pub fn install_package(package_name: &str) -> Result<InstallResult, ()> {
     let current_pid = crate::process::get_current_process_id();
     
     // Check permission
-    if !crate::security::request_permission(current_pid, "package.install").unwrap_or(false) {
+    if !crate::security::request_permission(current_pid as u32, "package.install").unwrap_or(false) {
         return Ok(InstallResult::PermissionDenied);
     }
     
@@ -275,7 +276,7 @@ pub fn remove_package(package_name: &str) -> Result<RemoveResult, ()> {
     let current_pid = crate::process::get_current_process_id();
     
     // Check permission
-    if !crate::security::request_permission(current_pid, "package.remove").unwrap_or(false) {
+    if !crate::security::request_permission(current_pid as u32, "package.remove").unwrap_or(false) {
         return Ok(RemoveResult::PermissionDenied);
     }
     
@@ -303,7 +304,7 @@ pub fn remove_package(package_name: &str) -> Result<RemoveResult, ()> {
     }
     
     // Remove package directory
-    let _ = crate::fs::remove_directory(&package.install_path);
+    let _ = crate::fs::remove(&package.install_path);
     
     // Remove from installed packages
     pkg_system.installed_packages.remove(package_name);
@@ -317,7 +318,7 @@ pub fn search_packages(query: &str) -> Result<SearchResult, ()> {
     let current_pid = crate::process::get_current_process_id();
     
     // Check permission
-    if !crate::security::request_permission(current_pid, "package.search").unwrap_or(false) {
+    if !crate::security::request_permission(current_pid as u32, "package.search").unwrap_or(false) {
         return Err(());
     }
     
@@ -350,7 +351,7 @@ pub fn list_installed_packages() -> Result<Vec<PackageInfo>, ()> {
     let current_pid = crate::process::get_current_process_id();
     
     // Check permission
-    if !crate::security::request_permission(current_pid, "package.list").unwrap_or(false) {
+    if !crate::security::request_permission(current_pid as u32, "package.list").unwrap_or(false) {
         return Err(());
     }
     
@@ -363,7 +364,7 @@ pub fn get_package_info(package_name: &str) -> Result<Option<PackageInfo>, ()> {
     let current_pid = crate::process::get_current_process_id();
     
     // Check permission
-    if !crate::security::request_permission(current_pid, "package.info").unwrap_or(false) {
+    if !crate::security::request_permission(current_pid as u32, "package.info").unwrap_or(false) {
         return Err(());
     }
     
@@ -390,7 +391,7 @@ pub fn update_package_database() -> Result<usize, ()> {
     let current_pid = crate::process::get_current_process_id();
     
     // Check permission
-    if !crate::security::request_permission(current_pid, "package.update").unwrap_or(false) {
+    if !crate::security::request_permission(current_pid as u32, "package.update").unwrap_or(false) {
         return Err(());
     }
     
@@ -416,25 +417,32 @@ pub fn upgrade_packages() -> Result<Vec<String>, ()> {
     let current_pid = crate::process::get_current_process_id();
     
     // Check permission
-    if !crate::security::request_permission(current_pid, "package.upgrade").unwrap_or(false) {
+    if !crate::security::request_permission(current_pid as u32, "package.upgrade").unwrap_or(false) {
         return Err(());
     }
     
     let mut upgraded_packages = Vec::new();
+    let mut upgrades_to_apply = Vec::new();
     
     // Check for upgrades
-    for (name, installed_pkg) in pkg_system.installed_packages.iter_mut() {
+    for (name, installed_pkg) in pkg_system.installed_packages.iter() {
         for repo in pkg_system.repositories.values() {
             if repo.enabled {
                 if let Some(repo_pkg) = repo.packages.get(name) {
                     if repo_pkg.version != installed_pkg.version {
-                        // Simulate upgrade
-                        installed_pkg.version = repo_pkg.version.clone();
+                        upgrades_to_apply.push((name.clone(), repo_pkg.version.clone()));
                         upgraded_packages.push(name.clone());
                         break;
                     }
                 }
             }
+        }
+    }
+    
+    // Apply upgrades
+    for (name, new_version) in upgrades_to_apply {
+        if let Some(installed_pkg) = pkg_system.installed_packages.get_mut(&name) {
+            installed_pkg.version = new_version;
         }
     }
     
@@ -447,7 +455,7 @@ pub fn add_repository(name: &str, url: &str) -> Result<(), ()> {
     let current_pid = crate::process::get_current_process_id();
     
     // Check permission
-    if !crate::security::request_permission(current_pid, "package.repo.add").unwrap_or(false) {
+    if !crate::security::request_permission(current_pid as u32, "package.repo.add").unwrap_or(false) {
         return Err(());
     }
     
@@ -463,7 +471,7 @@ pub fn remove_repository(name: &str) -> Result<(), ()> {
     let current_pid = crate::process::get_current_process_id();
     
     // Check permission
-    if !crate::security::request_permission(current_pid, "package.repo.remove").unwrap_or(false) {
+    if !crate::security::request_permission(current_pid as u32, "package.repo.remove").unwrap_or(false) {
         return Err(());
     }
     
@@ -482,7 +490,7 @@ pub fn list_repositories() -> Result<Vec<(String, String, bool)>, ()> {
     let current_pid = crate::process::get_current_process_id();
     
     // Check permission
-    if !crate::security::request_permission(current_pid, "package.repo.list").unwrap_or(false) {
+    if !crate::security::request_permission(current_pid as u32, "package.repo.list").unwrap_or(false) {
         return Err(());
     }
     
@@ -500,7 +508,7 @@ pub fn set_repository_enabled(name: &str, enabled: bool) -> Result<(), ()> {
     let current_pid = crate::process::get_current_process_id();
     
     // Check permission
-    if !crate::security::request_permission(current_pid, "package.repo.manage").unwrap_or(false) {
+    if !crate::security::request_permission(current_pid as u32, "package.repo.manage").unwrap_or(false) {
         return Err(());
     }
     
@@ -518,7 +526,7 @@ pub fn get_package_statistics() -> Result<(usize, usize, u64, u64), ()> {
     let current_pid = crate::process::get_current_process_id();
     
     // Check permission
-    if !crate::security::request_permission(current_pid, "package.stats").unwrap_or(false) {
+    if !crate::security::request_permission(current_pid as u32, "package.stats").unwrap_or(false) {
         return Err(());
     }
     
@@ -547,7 +555,7 @@ pub fn clean_package_cache() -> Result<u64, ()> {
     let current_pid = crate::process::get_current_process_id();
     
     // Check permission
-    if !crate::security::request_permission(current_pid, "package.clean").unwrap_or(false) {
+    if !crate::security::request_permission(current_pid as u32, "package.clean").unwrap_or(false) {
         return Err(());
     }
     
@@ -555,7 +563,7 @@ pub fn clean_package_cache() -> Result<u64, ()> {
     let cleaned_size = 50 * 1024 * 1024; // 50MB
     
     // Remove cache files
-    let _ = crate::fs::remove_directory(&pkg_system.cache_directory);
+    let _ = crate::fs::remove(&pkg_system.cache_directory);
     let _ = crate::fs::create_directory(&pkg_system.cache_directory);
     
     Ok(cleaned_size)
@@ -567,7 +575,7 @@ pub fn check_for_updates() -> Result<Vec<String>, ()> {
     let current_pid = crate::process::get_current_process_id();
     
     // Check permission
-    if !crate::security::request_permission(current_pid, "package.check").unwrap_or(false) {
+    if !crate::security::request_permission(current_pid as u32, "package.check").unwrap_or(false) {
         return Err(());
     }
     
@@ -596,14 +604,14 @@ pub fn verify_package(package_name: &str) -> Result<bool, ()> {
     let current_pid = crate::process::get_current_process_id();
     
     // Check permission
-    if !crate::security::request_permission(current_pid, "package.verify").unwrap_or(false) {
+    if !crate::security::request_permission(current_pid as u32, "package.verify").unwrap_or(false) {
         return Err(());
     }
     
     // Check if package is installed
     if let Some(package) = pkg_system.installed_packages.get(package_name) {
         // Simulate integrity check
-        let _ = crate::fs::get_metadata(&package.install_path);
+        let _ = crate::fs::metadata(&package.install_path);
         Ok(true) // Assume package is valid
     } else {
         Ok(false)

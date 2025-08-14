@@ -51,47 +51,37 @@ pub fn get_cpu_count() -> u32 {
     
     // Disable interrupts during CPUID operations
     interrupts::without_interrupts(|| {
-        // Check if CPUID supports leaf 0x0B (Extended Topology Enumeration)
-        let cpuid = raw_cpuid::CpuId::new();
+        // Use basic CPUID to get logical processor count
+        let mut eax: u32;
+        let mut ebx: u32;
+        let mut ecx: u32;
+        let mut edx: u32;
         
-        // Try extended topology enumeration first (Intel)
-        if let Some(topo_info) = cpuid.get_extended_topology_info() {
-            let mut max_cores = 1;
-            for level in topo_info {
-                if level.level_type() == raw_cpuid::TopologyType::Core {
-                    max_cores = level.processors();
-                    break;
-                }
-            }
-            return max_cores;
+        // CPUID leaf 1 - Feature Information
+        // Save and restore rbx manually to avoid LLVM conflicts
+        unsafe {
+            core::arch::asm!(
+                "push rbx",
+                "cpuid",
+                "mov {ebx_out:e}, ebx",
+                "pop rbx",
+                inout("eax") 1u32 => eax,
+                ebx_out = out(reg) ebx,
+                out("ecx") ecx,
+                out("edx") edx,
+            );
         }
         
-        // Fallback to basic CPUID leaf 1 and 4
-        if let Some(feature_info) = cpuid.get_feature_info() {
-            let logical_cores = feature_info.max_logical_processor_ids() as u32;
-            
-            // Try to get cores per package from cache info
-            if let Some(cache_info) = cpuid.get_cache_info() {
-                for cache in cache_info {
-                    if cache.cache_type() == raw_cpuid::CacheType::Data && cache.cache_level() == 1 {
-                        let cores_sharing = cache.max_cores_for_cache() + 1;
-                        if cores_sharing > 0 {
-                            return logical_cores / cores_sharing;
-                        }
-                    }
-                }
-            }
-            
-            // If hyperthreading is supported, assume 2 threads per core
-            if feature_info.has_htt() {
-                return logical_cores / 2;
-            }
-            
-            return logical_cores;
-        }
+        // Extract logical processor count from EBX[23:16]
+        let logical_cores = (ebx >> 16) & 0xFF;
         
-        // Ultimate fallback - assume single core
-        1
+        // For now, assume 1 core per logical processor (no hyperthreading detection)
+        // This is a simplified implementation
+        if logical_cores > 0 {
+            logical_cores
+        } else {
+            1 // Fallback to single core
+        }
     })
 }
 

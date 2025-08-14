@@ -2,6 +2,7 @@ use alloc::collections::BTreeMap;
 use alloc::borrow::ToOwned;
 use alloc::string::String;
 use alloc::vec::Vec;
+use alloc::vec;
 use alloc::boxed::Box;
 use core::fmt;
 use spin::{Mutex, RwLock};
@@ -651,4 +652,38 @@ pub fn mount_filesystem(filesystem: Box<dyn FileSystem>, mount_point: &str) -> F
 
 pub fn unmount_filesystem(mount_point: &str) -> FileSystemResult<()> {
     VFS.write().unmount(mount_point)
+}
+
+// Convenience functions for the fs module interface
+pub fn open_file(path: &str) -> Result<u64, ()> {
+    open(path, 0).map_err(|_| ())
+}
+
+pub fn close_file(fd: u64) -> Result<(), ()> {
+    close(fd).map_err(|_| ())
+}
+
+pub fn read_file_fd(fd: u64, max_size: usize) -> Result<Vec<u8>, ()> {
+    let mut buffer = vec![0u8; max_size];
+    match read(fd, &mut buffer) {
+        Ok(bytes_read) => {
+            buffer.truncate(bytes_read);
+            Ok(buffer)
+        }
+        Err(_) => Err(())
+    }
+}
+
+pub fn write_file(fd: u64, data: &[u8]) -> Result<usize, ()> {
+    write(fd, data).map_err(|_| ())
+}
+
+// Read entire file by path (convenience function)
+pub fn read_file(path: &str) -> Result<Vec<u8>, ()> {
+    let fd = open_file(path)?;
+    let metadata_result = metadata(path).map_err(|_| ())?;
+    let size = metadata_result.size as usize;
+    let result = read_file_fd(fd, size);
+    let _ = close_file(fd);
+    result
 }
