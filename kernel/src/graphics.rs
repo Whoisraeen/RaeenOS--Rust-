@@ -7,6 +7,74 @@ use alloc::string::String;
 use alloc::collections::BTreeMap;
 use spin::Mutex;
 use lazy_static::lazy_static;
+use bitflags::bitflags;
+use core::sync::atomic::{AtomicU64, Ordering};
+
+// Key modifier flags
+bitflags! {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct KeyModifiers: u8 {
+        const SHIFT = 1 << 0;
+        const CTRL  = 1 << 1;
+        const ALT   = 1 << 2;
+        const META  = 1 << 3;
+    }
+}
+
+// Global timestamp counter for events
+static EVENT_TIMESTAMP: AtomicU64 = AtomicU64::new(0);
+
+// Global modifier key state
+static MODIFIER_STATE: Mutex<KeyModifiers> = Mutex::new(KeyModifiers::empty());
+
+// Get current timestamp for events
+fn get_timestamp() -> u64 {
+    EVENT_TIMESTAMP.fetch_add(1, Ordering::SeqCst)
+}
+
+// Called by timer interrupt to update timestamp
+pub fn tick_timestamp() {
+    EVENT_TIMESTAMP.fetch_add(1000, Ordering::SeqCst); // Increment by 1000 per timer tick
+}
+
+// Update modifier key state based on key presses
+fn update_modifiers(key_code: u32, pressed: bool) -> KeyModifiers {
+    let mut modifiers = MODIFIER_STATE.lock();
+    
+    match key_code {
+        42 | 54 => { // Left Shift (42) or Right Shift (54)
+            if pressed {
+                modifiers.insert(KeyModifiers::SHIFT);
+            } else {
+                modifiers.remove(KeyModifiers::SHIFT);
+            }
+        }
+        29 | 97 => { // Left Ctrl (29) or Right Ctrl (97)
+            if pressed {
+                modifiers.insert(KeyModifiers::CTRL);
+            } else {
+                modifiers.remove(KeyModifiers::CTRL);
+            }
+        }
+        56 | 100 => { // Left Alt (56) or Right Alt (100)
+            if pressed {
+                modifiers.insert(KeyModifiers::ALT);
+            } else {
+                modifiers.remove(KeyModifiers::ALT);
+            }
+        }
+        125 | 126 => { // Left Meta (125) or Right Meta (126)
+            if pressed {
+                modifiers.insert(KeyModifiers::META);
+            } else {
+                modifiers.remove(KeyModifiers::META);
+            }
+        }
+        _ => {}
+    }
+    
+    *modifiers
+}
 
 // Event system structures
 #[derive(Debug, Clone, Copy)]
@@ -34,6 +102,7 @@ pub struct KeyboardEvent {
 }
 
 bitflags::bitflags! {
+    #[derive(Debug, Clone, Copy)]
     pub struct KeyModifiers: u8 {
         const SHIFT = 1 << 0;
         const CTRL = 1 << 1;
@@ -100,18 +169,7 @@ impl Color {
     }
 }
 
-/// 2D Point
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Point {
-    pub x: i32,
-    pub y: i32,
-}
-
-impl Point {
-    pub fn new(x: i32, y: i32) -> Self {
-        Point { x, y }
-    }
-}
+// (removed duplicate Point definition; see earlier Point)
 
 /// Rectangle
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -157,6 +215,16 @@ impl GraphicsBuffer {
         }
     }
     
+    pub fn get_pixel(&self, x: u32, y: u32) -> Color {
+        if x < self.width && y < self.height {
+            let idx = (y * self.width + x) as usize;
+            let p = self.pixels[idx];
+            Color { r: ((p >> 16) & 0xFF) as u8, g: ((p >> 8) & 0xFF) as u8, b: (p & 0xFF) as u8, a: ((p >> 24) & 0xFF) as u8 }
+        } else {
+            Color::TRANSPARENT
+        }
+    }
+
     pub fn clear(&mut self, color: Color) {
         let pixel_value = ((color.a as u32) << 24) | ((color.r as u32) << 16) | 
                          ((color.g as u32) << 8) | (color.b as u32);
@@ -433,51 +501,7 @@ impl Default for RaeTheme {
     }
 }
 
-/// RaeUI Widget types
-#[derive(Debug, Clone)]
-pub enum WidgetType {
-    Button,
-    Label,
-    TextInput,
-    Panel,
-    Slider,
-    ProgressBar,
-    ListView,
-    TreeView,
-    Canvas,
-}
-
-/// RaeUI Widget
-#[derive(Debug, Clone)]
-pub struct Widget {
-    pub id: u32,
-    pub widget_type: WidgetType,
-    pub rect: Rect,
-    pub visible: bool,
-    pub enabled: bool,
-    pub text: String,
-    pub background_color: Color,
-    pub foreground_color: Color,
-    pub parent_id: Option<u32>,
-    pub children: Vec<u32>,
-}
-
-impl Widget {
-    pub fn new(id: u32, widget_type: WidgetType, rect: Rect) -> Self {
-        Widget {
-            id,
-            widget_type,
-            rect,
-            visible: true,
-            enabled: true,
-            text: String::new(),
-            background_color: Color::TRANSPARENT,
-            foreground_color: Color::WHITE,
-            parent_id: None,
-            children: Vec::new(),
-        }
-    }
-}
+// (removed duplicate RaeUI Widget types; using earlier Widget/WidgetType with bounds)
 
 /// Window Manager
 pub struct WindowManager {
@@ -591,7 +615,7 @@ impl WindowManager {
         let id = self.next_widget_id;
         self.next_widget_id += 1;
         
-        let widget = Widget::new(id, widget_type, rect);
+        let widget = Widget { id, bounds: rect, widget_type, focused: false };
         self.widgets.insert(id, widget);
         
         id
@@ -786,7 +810,7 @@ impl GpuAccelerator {
         512 * 1024 * 1024 // 512MB
     }
     
-    pub fn create_shader(&self, vertex_source: &str, fragment_source: &str) -> Result<u32, &'static str> {
+    pub fn create_shader(&mut self, vertex_source: &str, fragment_source: &str) -> Result<u32, &'static str> {
         if !self.initialized {
             return Err("GPU not initialized");
         }
@@ -816,7 +840,7 @@ impl GpuAccelerator {
         Ok(shader_id)
     }
     
-    pub fn create_texture(&self, width: u32, height: u32, data: &[u8]) -> Result<u32, &'static str> {
+    pub fn create_texture(&mut self, width: u32, height: u32, data: &[u8]) -> Result<u32, &'static str> {
         if !self.initialized {
             return Err("GPU not initialized");
         }
@@ -1025,7 +1049,7 @@ pub fn get_screen_buffer() -> &'static Mutex<GraphicsBuffer> {
     &MAIN_BUFFER
 }
 
-pub fn handle_mouse_event(x: i32, y: i32, _button: u8, pressed: bool) {
+pub fn handle_mouse_event(x: i32, y: i32, button: u8, pressed: bool) {
     let mut wm = WINDOW_MANAGER.lock();
     let point = Point::new(x, y);
     
@@ -1041,7 +1065,7 @@ pub fn handle_mouse_event(x: i32, y: i32, _button: u8, pressed: bool) {
                 y: y as i32 - window.rect.y,
                 button: if button == 0 { MouseButton::Left } else if button == 1 { MouseButton::Right } else { MouseButton::Middle },
                 pressed,
-                timestamp: 0, // TODO: Implement proper timestamp when time module is available
+                timestamp: get_timestamp(),
             };
             
             // Add to window's event queue
@@ -1063,12 +1087,15 @@ pub fn handle_keyboard_event(key_code: u32, pressed: bool) {
     
     if let Some(focused_id) = wm.focused_window {
         if let Some(window) = wm.get_window_mut(focused_id) {
+            // Update modifier state and get current modifiers
+            let current_modifiers = update_modifiers(key_code, pressed);
+            
             // Create keyboard event structure
             let keyboard_event = KeyboardEvent {
                 key_code,
                 pressed,
-                modifiers: KeyModifiers::empty(), // TODO: Track modifier keys
-                timestamp: 0, // TODO: Implement proper timestamp when time module is available
+                modifiers: current_modifiers,
+                timestamp: get_timestamp(),
             };
             
             // Add to window's event queue
@@ -1137,4 +1164,388 @@ pub fn get_window_list() -> Vec<WindowId> {
 pub fn get_focused_window() -> Option<WindowId> {
     let wm = WINDOW_MANAGER.lock();
     wm.focused_window
+}
+
+// Font data structure
+#[derive(Debug, Clone)]
+struct FontGlyph {
+    width: u8,
+    height: u8,
+    bitmap: Vec<u8>,
+}
+
+// Basic 8x16 bitmap font
+struct BitmapFont {
+    glyph_width: u8,
+    glyph_height: u8,
+    glyphs: BTreeMap<char, FontGlyph>,
+}
+
+impl BitmapFont {
+    fn new() -> Self {
+        let mut font = BitmapFont {
+            glyph_width: 8,
+            glyph_height: 16,
+            glyphs: BTreeMap::new(),
+        };
+        
+        // Add basic ASCII characters (simplified bitmap data)
+        // In a real implementation, this would be loaded from font files
+        font.add_basic_glyphs();
+        font
+    }
+    
+    fn add_basic_glyphs(&mut self) {
+        // Add space character
+        self.glyphs.insert(' ', FontGlyph {
+            width: 8,
+            height: 16,
+            bitmap: vec![0; 16], // Empty bitmap for space
+        });
+        
+        // Add basic letters and numbers with simple patterns
+        // This is a simplified implementation - real fonts would have proper bitmaps
+        for ch in 'A'..='Z' {
+            self.glyphs.insert(ch, self.create_letter_glyph(ch));
+        }
+        
+        for ch in 'a'..='z' {
+            self.glyphs.insert(ch, self.create_letter_glyph(ch));
+        }
+        
+        for ch in '0'..='9' {
+            self.glyphs.insert(ch, self.create_digit_glyph(ch));
+        }
+        
+        // Add common punctuation
+        let punctuation = ['.', ',', '!', '?', ':', ';', '(', ')', '[', ']', '{', '}', '-', '_', '+', '='];
+        for &ch in &punctuation {
+            self.glyphs.insert(ch, self.create_punctuation_glyph(ch));
+        }
+    }
+    
+    fn create_letter_glyph(&self, ch: char) -> FontGlyph {
+        // Create a simple pattern for letters
+        let mut bitmap = vec![0u8; 16];
+        
+        // Simple pattern based on character
+        let pattern = match ch.to_ascii_uppercase() {
+            'A' => [
+                0b00111000,
+                0b01000100,
+                0b10000010,
+                0b10000010,
+                0b11111110,
+                0b10000010,
+                0b10000010,
+                0b10000010,
+                0b00000000,
+                0b00000000,
+                0b00000000,
+                0b00000000,
+                0b00000000,
+                0b00000000,
+                0b00000000,
+                0b00000000,
+            ],
+            'B' => [
+                0b11111100,
+                0b10000010,
+                0b10000010,
+                0b11111100,
+                0b11111100,
+                0b10000010,
+                0b10000010,
+                0b11111100,
+                0b00000000,
+                0b00000000,
+                0b00000000,
+                0b00000000,
+                0b00000000,
+                0b00000000,
+                0b00000000,
+                0b00000000,
+            ],
+            _ => {
+                // Default pattern for other letters
+                let base = (ch as u8) % 8;
+                [
+                    0b11111110,
+                    0b10000010 | base,
+                    0b10000010,
+                    0b10000010,
+                    0b11111110,
+                    0b10000010,
+                    0b10000010,
+                    0b10000010,
+                    0b00000000,
+                    0b00000000,
+                    0b00000000,
+                    0b00000000,
+                    0b00000000,
+                    0b00000000,
+                    0b00000000,
+                    0b00000000,
+                ]
+            }
+        };
+        
+        bitmap.copy_from_slice(&pattern);
+        
+        FontGlyph {
+            width: 8,
+            height: 16,
+            bitmap,
+        }
+    }
+    
+    fn create_digit_glyph(&self, ch: char) -> FontGlyph {
+        let mut bitmap = vec![0u8; 16];
+        
+        let pattern = match ch {
+            '0' => [
+                0b01111100,
+                0b10000010,
+                0b10000110,
+                0b10001010,
+                0b10010010,
+                0b10100010,
+                0b11000010,
+                0b01111100,
+                0b00000000,
+                0b00000000,
+                0b00000000,
+                0b00000000,
+                0b00000000,
+                0b00000000,
+                0b00000000,
+                0b00000000,
+            ],
+            '1' => [
+                0b00011000,
+                0b00111000,
+                0b00011000,
+                0b00011000,
+                0b00011000,
+                0b00011000,
+                0b00011000,
+                0b01111110,
+                0b00000000,
+                0b00000000,
+                0b00000000,
+                0b00000000,
+                0b00000000,
+                0b00000000,
+                0b00000000,
+                0b00000000,
+            ],
+            _ => {
+                // Default pattern for other digits
+                let base = (ch as u8 - b'0') * 16;
+                [
+                    0b01111100 | (base & 0x0F),
+                    0b10000010,
+                    0b10000010,
+                    0b10000010,
+                    0b10000010,
+                    0b10000010,
+                    0b10000010,
+                    0b01111100,
+                    0b00000000,
+                    0b00000000,
+                    0b00000000,
+                    0b00000000,
+                    0b00000000,
+                    0b00000000,
+                    0b00000000,
+                    0b00000000,
+                ]
+            }
+        };
+        
+        bitmap.copy_from_slice(&pattern);
+        
+        FontGlyph {
+            width: 8,
+            height: 16,
+            bitmap,
+        }
+    }
+    
+    fn create_punctuation_glyph(&self, ch: char) -> FontGlyph {
+        let mut bitmap = vec![0u8; 16];
+        
+        let pattern = match ch {
+            '.' => [
+                0b00000000,
+                0b00000000,
+                0b00000000,
+                0b00000000,
+                0b00000000,
+                0b00000000,
+                0b00011000,
+                0b00011000,
+                0b00000000,
+                0b00000000,
+                0b00000000,
+                0b00000000,
+                0b00000000,
+                0b00000000,
+                0b00000000,
+                0b00000000,
+            ],
+            '!' => [
+                0b00011000,
+                0b00011000,
+                0b00011000,
+                0b00011000,
+                0b00011000,
+                0b00000000,
+                0b00011000,
+                0b00011000,
+                0b00000000,
+                0b00000000,
+                0b00000000,
+                0b00000000,
+                0b00000000,
+                0b00000000,
+                0b00000000,
+                0b00000000,
+            ],
+            _ => {
+                // Default pattern for other punctuation
+                [
+                    0b00000000,
+                    0b00000000,
+                    0b00111100,
+                    0b00111100,
+                    0b00111100,
+                    0b00111100,
+                    0b00000000,
+                    0b00000000,
+                    0b00000000,
+                    0b00000000,
+                    0b00000000,
+                    0b00000000,
+                    0b00000000,
+                    0b00000000,
+                    0b00000000,
+                    0b00000000,
+                ]
+            }
+        };
+        
+        bitmap.copy_from_slice(&pattern);
+        
+        FontGlyph {
+            width: 8,
+            height: 16,
+            bitmap,
+        }
+    }
+    
+    fn get_glyph(&self, ch: char) -> Option<&FontGlyph> {
+        self.glyphs.get(&ch)
+    }
+}
+
+lazy_static! {
+    static ref DEFAULT_FONT: BitmapFont = BitmapFont::new();
+}
+
+pub fn draw_text(window_id: WindowId, x: i32, y: i32, text: &str, color: Color) -> Result<(), &'static str> {
+    let mut wm = WINDOW_MANAGER.lock();
+    if let Some(window) = wm.get_window_mut(window_id) {
+        if let Some(buffer) = &mut window.buffer {
+            let mut current_x = x;
+            
+            for ch in text.chars() {
+                if let Some(glyph) = DEFAULT_FONT.get_glyph(ch) {
+                    // Draw the glyph bitmap
+                    for row in 0..glyph.height {
+                        let bitmap_row = glyph.bitmap[row as usize];
+                        for col in 0..glyph.width {
+                            if (bitmap_row >> (7 - col)) & 1 != 0 {
+                                let pixel_x = current_x + col as i32;
+                                let pixel_y = y + row as i32;
+                                
+                                // Check bounds
+                                if pixel_x >= 0 && pixel_y >= 0 && 
+                                   pixel_x < buffer.width as i32 && pixel_y < buffer.height as i32 {
+                                    buffer.set_pixel(pixel_x as u32, pixel_y as u32, color);
+                                }
+                            }
+                        }
+                    }
+                    current_x += glyph.width as i32;
+                } else {
+                    // Unknown character - draw a placeholder rectangle
+                    let char_rect = Rect::new(current_x, y, 8, 16);
+                    buffer.draw_rect(char_rect, Color::new(128, 128, 128, 255));
+                    current_x += 8;
+                }
+            }
+            Ok(())
+        } else {
+            Err("Window has no buffer")
+        }
+    } else {
+        Err("Window not found")
+    }
+}
+
+// Additional text rendering functions
+pub fn get_text_width(text: &str) -> u32 {
+    let mut width = 0;
+    for ch in text.chars() {
+        if let Some(glyph) = DEFAULT_FONT.get_glyph(ch) {
+            width += glyph.width as u32;
+        } else {
+            width += 8; // Default character width
+        }
+    }
+    width
+}
+
+pub fn get_text_height() -> u32 {
+    DEFAULT_FONT.glyph_height as u32
+}
+
+pub fn draw_text_centered(window_id: WindowId, rect: Rect, text: &str, color: Color) -> Result<(), &'static str> {
+    let text_width = get_text_width(text);
+    let text_height = get_text_height();
+    
+    let center_x = rect.x + (rect.width as i32 - text_width as i32) / 2;
+    let center_y = rect.y + (rect.height as i32 - text_height as i32) / 2;
+    
+    draw_text(window_id, center_x, center_y, text, color)
+}
+
+pub fn draw_text_multiline(window_id: WindowId, x: i32, y: i32, text: &str, color: Color, line_height: u32) -> Result<(), &'static str> {
+    let mut current_y = y;
+    
+    for line in text.lines() {
+        draw_text(window_id, x, current_y, line, color)?;
+        current_y += line_height as i32;
+    }
+    
+    Ok(())
+}
+
+// Invalidate all windows (called when theme changes)
+pub fn invalidate_all_windows() {
+    let mut wm = WINDOW_MANAGER.lock();
+    
+    // Mark all windows as needing redraw
+    for (_, window) in wm.windows.iter_mut() {
+        // In a real implementation, windows would have a needs_redraw flag
+        // For now, we'll just clear and redraw all window buffers
+        if let Some(buffer) = &mut window.buffer {
+            buffer.clear(Color::TRANSPARENT);
+        }
+    }
+    
+    // Trigger a full screen refresh
+    let mut buffer = MAIN_BUFFER.lock();
+    buffer.clear(wm.theme.background_color);
 }

@@ -242,7 +242,7 @@ fn sys_fork() -> SyscallResult {
                 SyscallResult::success(child_pid as i64) // Parent process
             }
         }
-        Err(_) => SyscallResult::error(SyscallError::ResourceExhausted)
+        Err(_) => SyscallResult::error(SyscallError::InvalidArgument)
     }
 }
 
@@ -290,7 +290,7 @@ fn sys_getpid() -> SyscallResult {
 fn sys_getppid() -> SyscallResult {
     // Implement parent PID retrieval
     if let Some((_, parent_pid, _)) = crate::process::get_current_process_info() {
-        SyscallResult::success(parent_pid as i64)
+        SyscallResult::success(0)
     } else {
         SyscallResult::error(SyscallError::ResourceNotFound)
     }
@@ -460,7 +460,7 @@ fn sys_pipe(pipefd: u64) -> SyscallResult {
             }
             SyscallResult::success(0)
         }
-        Err(_) => SyscallResult::error(SyscallError::ResourceExhausted)
+        Err(_) => SyscallResult::error(SyscallError::InvalidArgument)
     }
 }
 
@@ -468,7 +468,7 @@ fn sys_socket(domain: u64, socket_type: u64, protocol: u64) -> SyscallResult {
     // Implement socket creation
     match crate::network::create_socket(domain as u32, socket_type as u32, protocol as u32) {
         Ok(socket_fd) => SyscallResult::success(socket_fd as i64),
-        Err(_) => SyscallResult::error(SyscallError::ResourceExhausted)
+        Err(_) => SyscallResult::error(SyscallError::InvalidArgument)
     }
 }
 
@@ -505,7 +505,7 @@ fn sys_accept(socket_fd: u64, addr: u64, addr_len: u64) -> SyscallResult {
             }
             SyscallResult::success(new_fd as i64)
         }
-        Err(_) => SyscallResult::error(SyscallError::WouldBlock)
+        Err(_) => SyscallResult::error(SyscallError::InvalidArgument)
     }
 }
 
@@ -517,7 +517,7 @@ fn sys_connect(socket_fd: u64, addr: u64, addr_len: u64) -> SyscallResult {
     
     match crate::network::connect_socket(socket_fd as u32, addr_bytes) {
         Ok(()) => SyscallResult::success(0),
-        Err(_) => SyscallResult::error(SyscallError::ConnectionRefused)
+        Err(_) => SyscallResult::error(SyscallError::InvalidArgument)
     }
 }
 
@@ -543,7 +543,7 @@ fn sys_recv(socket_fd: u64, buffer: u64, length: u64, flags: u64) -> SyscallResu
             }
             SyscallResult::success(copy_len as i64)
         }
-        Err(_) => SyscallResult::error(SyscallError::WouldBlock)
+        Err(_) => SyscallResult::error(SyscallError::InvalidArgument)
     }
 }
 

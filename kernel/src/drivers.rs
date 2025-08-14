@@ -415,7 +415,7 @@ impl AtaDriver {
             drive_port.write(drive_select | (((lba >> 24) & 0x0F) as u8));
             
             // Send WRITE SECTORS command
-            command_port.write(0x30);
+            command_port.write(0x30u8);
             
             // Wait for drive to be ready
             while (status_port.read() & 0x80) != 0 {} // Wait for BSY to clear
@@ -435,7 +435,7 @@ impl AtaDriver {
             }
             
             // Flush cache
-            command_port.write(0xE7);
+            command_port.write(0xE7u8);
             while (status_port.read() & 0x80) != 0 {} // Wait for BSY to clear
         }
         
@@ -601,9 +601,9 @@ impl Device for Ps2MouseDriver {
             let mut data_port = Port::new(0x60);
             
             // Read mouse packet (3 bytes)
-            let byte1 = data_port.read();
-            let byte2 = data_port.read();
-            let byte3 = data_port.read();
+            let byte1: u8 = data_port.read();
+            let byte2: u8 = data_port.read();
+            let byte3: u8 = data_port.read();
             
             // Update button state
             self.buttons = byte1 & 0x07;
@@ -726,6 +726,7 @@ pub fn get_mouse_position() -> Option<(i32, i32)> {
     None
 }
 
+
 pub fn get_mouse_buttons() -> Option<u8> {
     let manager = DEVICE_MANAGER.read();
     let input_devices = manager.get_devices_by_type(DeviceType::Input);
@@ -739,4 +740,24 @@ pub fn get_mouse_buttons() -> Option<u8> {
     }
     
     None
+}
+
+// Keyboard and Mouse modules for syscalls
+pub mod keyboard {
+    use alloc::collections::VecDeque;
+    use spin::Mutex;
+    
+    static KEY_QUEUE: Mutex<VecDeque<u8>> = Mutex::new(VecDeque::new());
+    
+    pub fn init() {}
+    
+    pub fn get_key() -> Option<u8> {
+        KEY_QUEUE.lock().pop_front()
+    }
+}
+
+pub mod mouse {
+    pub fn get_mouse_state() -> Option<(i32, i32, u8)> {
+        Some((0, 0, 0))
+    }
 }

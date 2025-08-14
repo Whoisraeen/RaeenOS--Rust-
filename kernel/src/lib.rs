@@ -17,12 +17,17 @@ pub mod filesystem;
 // pub mod network;
 // pub mod ipc;
 pub mod graphics;
-// pub mod raeshell;
-// pub mod raepkg;
-// pub mod raede;
-// pub mod raekit;
-// pub mod rae_assistant;
-// pub mod security;
+pub mod drivers;
+pub mod network;
+pub mod ipc;
+pub mod ui;
+pub mod sound;
+pub mod security;
+pub mod rae_assistant;
+pub mod raeshell;
+pub mod raepkg;
+pub mod raede;
+pub mod raekit;
 
 extern crate alloc;
 
@@ -43,7 +48,7 @@ pub fn init(boot_info: &'static bootloader::BootInfo) {
     // Initialize threading system
     let idle_pid = process::init_idle_thread();
     let demo_pid = process::spawn_demo_thread();
-    serial::serial_println!("Initialized idle thread (PID: {}) and demo thread (PID: {})", idle_pid, demo_pid);
+    crate::serial::_print(format_args!("Initialized idle thread (PID: {}) and demo thread (PID: {})\n", idle_pid, demo_pid));
     
     syscall::init();
     // other subsystems init later

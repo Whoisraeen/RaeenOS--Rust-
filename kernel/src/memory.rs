@@ -47,7 +47,7 @@ unsafe impl FrameAllocator<Size4KiB> for BootInfoFrameAllocator {
 // ---------- Global accessors for mapper/frame allocator ----------
 
 static PHYS_OFFSET: AtomicU64 = AtomicU64::new(0);
-static FRAME_ALLOC: Mutex<Option<BootInfoFrameAllocator>> = Mutex::new(None);
+pub static FRAME_ALLOC: Mutex<Option<BootInfoFrameAllocator>> = Mutex::new(None);
 
 pub fn active_physical_offset() -> u64 { PHYS_OFFSET.load(Ordering::SeqCst) }
 
@@ -78,6 +78,162 @@ pub fn phys_to_virt(phys_addr: PhysAddr) -> VirtAddr {
 // Convert virtual address to physical address using the physical memory offset
 pub fn virt_to_phys(virt_addr: VirtAddr) -> PhysAddr {
     PhysAddr::new(virt_addr.as_u64() - active_physical_offset())
+}
+
+use spin::Mutex;
+use lazy_static::lazy_static;
+
+// Memory statistics tracking
+struct MemoryStats {
+    total_memory: u64,
+    allocated_frames: u64,
+    heap_break: VirtAddr,
+}
+
+lazy_static! {
+    static ref MEMORY_STATS: Mutex<MemoryStats> = Mutex::new(MemoryStats {
+        total_memory: 0,
+        allocated_frames: 0,
+        heap_break: VirtAddr::new(0x400000000), // Start heap at 16GB virtual address
+    });
+}
+
+// Initialize memory statistics from bootloader info
+pub fn init_memory_stats(total_memory: u64) {
+    let mut stats = MEMORY_STATS.lock();
+    stats.total_memory = total_memory;
+}
+
+// Memory management functions for syscalls
+pub fn set_program_break(addr: VirtAddr) -> Result<VirtAddr, ()> {
+    let mut stats = MEMORY_STATS.lock();
+    let current_break = stats.heap_break;
+    
+    // Validate the new break address
+    if addr < current_break {
+        // Shrinking heap - unmap pages
+        let pages_to_unmap = (current_break.as_u64() - addr.as_u64()) / 4096;
+        
+        // Get current process for permission checking
+        let current_pid = crate::process::get_current_process_id();
+        if !crate::security::request_permission(current_pid, "memory.alloc").unwrap_or(false) {
+            return Err(());
+        }
+        
+        // Unmap the pages (simplified)
+        with_mapper(|mapper| {
+            let mut current_addr = addr;
+            while current_addr < current_break {
+                if let Ok((frame, _)) = mapper.translate_page(Page::containing_address(current_addr)) {
+                    let _ = mapper.unmap(Page::containing_address(current_addr));
+                    with_frame_allocator(|allocator| {
+                        allocator.deallocate_frame(frame);
+                    });
+                }
+                current_addr += 4096u64;
+            }
+        });
+        
+        stats.heap_break = addr;
+        Ok(addr)
+    } else if addr > current_break {
+        // Growing heap - map new pages
+        let pages_to_map = (addr.as_u64() - current_break.as_u64()) / 4096;
+        
+        // Check memory allocation permission
+        let current_pid = crate::process::get_current_process_id();
+        if !crate::security::request_permission(current_pid, "memory.alloc").unwrap_or(false) {
+            return Err(());
+        }
+        
+        // Check if we have enough free memory
+        let required_memory = pages_to_map * 4096;
+        if get_free_memory() < required_memory {
+            return Err(()); // Out of memory
+        }
+        
+        // Map the new pages
+        with_mapper(|mapper| {
+            with_frame_allocator(|allocator| {
+                let mut current_addr = current_break;
+                while current_addr < addr {
+                    let page = Page::containing_address(current_addr);
+                    if let Ok(frame) = allocator.allocate_frame() {
+                        let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
+                        if mapper.map_to(page, frame, flags, allocator).is_ok() {
+                            // Zero the page for security
+                            unsafe {
+                                let page_ptr = current_addr.as_mut_ptr::<u8>();
+                                core::ptr::write_bytes(page_ptr, 0, 4096);
+                            }
+                        } else {
+                            // Mapping failed, deallocate frame
+                            allocator.deallocate_frame(frame);
+                            return Err(());
+                        }
+                    } else {
+                        return Err(()); // Frame allocation failed
+                    }
+                    current_addr += 4096u64;
+                }
+                Ok(())
+            })
+        }).map_err(|_| ())?;
+        
+        stats.heap_break = addr;
+        stats.allocated_frames += pages_to_map;
+        Ok(addr)
+    } else {
+        // No change
+        Ok(current_break)
+    }
+}
+
+pub fn get_total_memory() -> u64 {
+    let stats = MEMORY_STATS.lock();
+    if stats.total_memory == 0 {
+        // Fallback: try to detect memory from bootloader or use conservative estimate
+        256 * 1024 * 1024 // 256MB fallback
+    } else {
+        stats.total_memory
+    }
+}
+
+pub fn get_free_memory() -> u64 {
+    let stats = MEMORY_STATS.lock();
+    let total = if stats.total_memory == 0 {
+        256 * 1024 * 1024 // 256MB fallback
+    } else {
+        stats.total_memory
+    };
+    
+    let used = stats.allocated_frames * 4096;
+    
+    // Reserve some memory for kernel operations
+    let kernel_reserved = 32 * 1024 * 1024; // 32MB for kernel
+    
+    if total > used + kernel_reserved {
+        total - used - kernel_reserved
+    } else {
+        0
+    }
+}
+
+// Update allocated frame count (called by frame allocator)
+pub fn update_allocated_frames(delta: i64) {
+    let mut stats = MEMORY_STATS.lock();
+    if delta < 0 {
+        let decrease = (-delta) as u64;
+        stats.allocated_frames = stats.allocated_frames.saturating_sub(decrease);
+    } else {
+        stats.allocated_frames += delta as u64;
+    }
+}
+
+// Get current program break
+pub fn get_program_break() -> VirtAddr {
+    let stats = MEMORY_STATS.lock();
+    stats.heap_break
 }
 
 

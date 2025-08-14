@@ -84,7 +84,7 @@ pub struct Process {
     pub open_files: Vec<u64>, // File descriptor IDs
     pub permissions: ProcessPermissions,
     // Keep kernel stack backing alive for kernel threads
-    pub kernel_stack_ptr: Option<*mut u8>,
+    pub kernel_stack_ptr: Option<usize>, // Store as usize to make it Send
 }
 
 #[derive(Debug, Clone)]
@@ -165,7 +165,7 @@ impl Process {
     }
 
     pub fn with_kernel_stack(mut self, stack_ptr: *mut u8, stack_size: usize) -> Self {
-        self.kernel_stack_ptr = Some(stack_ptr);
+        self.kernel_stack_ptr = Some(stack_ptr as usize);
         self.stack_base = VirtAddr::new(stack_ptr as u64);
         self.stack_size = stack_size;
         self.context.rsp = (stack_ptr as u64) + stack_size as u64;
@@ -239,7 +239,7 @@ impl Scheduler {
         }
         
         // Round-robin within priority levels
-        for (priority, queue) in self.ready_queues.iter_mut().enumerate() {
+        for (_priority, queue) in self.ready_queues.iter_mut().enumerate() {
             if let Some(pid) = queue.pop_front() {
                 // Re-add to end of queue for round-robin
                 queue.push_back(pid);
@@ -482,12 +482,13 @@ pub fn schedule_tick() {
     let time_slice_expired = scheduler.tick_time_slice();
     
     // Only preempt if time slice expired or current process is not running
+    let idle_pid = scheduler.idle_thread_pid;
     let should_schedule = if let Some(pid) = current {
         if let Some(proc_ref) = scheduler.processes.get_mut(pid as usize).and_then(|p| p.as_mut()) {
             if proc_ref.state == ProcessState::Running {
                 if time_slice_expired {
                     // Time slice expired, move back to ready queue (unless it's idle thread)
-                    if Some(pid) != scheduler.idle_thread_pid {
+                    if Some(pid) != idle_pid {
                         proc_ref.state = ProcessState::Ready;
                         let prio = proc_ref.priority as usize;
                         scheduler.ready_queues[prio].push_back(pid);
@@ -516,4 +517,152 @@ pub fn schedule_tick() {
             context_switch(current, next_pid);
         }
     }
+}
+
+// Process management functions for syscalls
+pub fn fork_process() -> Result<ProcessId, ()> {
+    let mut scheduler = SCHEDULER.lock();
+    let current_pid = scheduler.current_process;
+    
+    // Get the current process
+    let parent_process = scheduler.processes.get(&current_pid).ok_or(())?;
+    
+    // Create a new process ID
+    let child_pid = scheduler.next_pid;
+    scheduler.next_pid += 1;
+    
+    // Clone the parent process
+    let mut child_process = parent_process.clone();
+    child_process.pid = child_pid;
+    child_process.parent_pid = Some(current_pid);
+    child_process.state = ProcessState::Ready;
+    
+    // Initialize security context for child process
+    crate::security::init_process_security(child_pid, Some(current_pid)).map_err(|_| ())?;
+    
+    // Add child to parent's children list
+    if let Some(parent) = scheduler.processes.get_mut(&current_pid) {
+        parent.children.push(child_pid);
+    }
+    
+    // Insert the child process
+    scheduler.processes.insert(child_pid, child_process);
+    scheduler.ready_queue.push_back(child_pid);
+    
+    Ok(child_pid)
+}
+
+pub fn exec_process(path: &str, args: &[&str]) -> Result<(), ()> {
+    use alloc::string::String;
+    use alloc::vec::Vec;
+    
+    let mut scheduler = SCHEDULER.lock();
+    let current_pid = scheduler.current_process;
+    
+    // Get the current process
+    let process = scheduler.processes.get_mut(&current_pid).ok_or(())?;
+    
+    // Check if we have permission to execute files
+    if !crate::security::request_permission(current_pid, "file.execute").unwrap_or(false) {
+        return Err(());
+    }
+    
+    // Validate the executable path
+    if !crate::security::check_path_access(current_pid, path, "execute").unwrap_or(false) {
+        return Err(());
+    }
+    
+    // Try to load the executable from filesystem
+    let fs = crate::filesystem::get_filesystem();
+    let file_data = fs.read_file(path).map_err(|_| ())?;
+    
+    // Basic ELF header validation (simplified)
+    if file_data.len() < 4 || &file_data[0..4] != b"\x7fELF" {
+        return Err(()); // Not a valid ELF file
+    }
+    
+    // Reset process memory (simplified - in reality would parse ELF and map sections)
+    process.memory_usage = 0;
+    process.cpu_time = 0;
+    
+    // Store command line arguments
+    let mut argv: Vec<String> = Vec::new();
+    argv.push(String::from(path));
+    for arg in args {
+        argv.push(String::from(*arg));
+    }
+    
+    // In a real implementation, we would:
+    // 1. Parse ELF headers and program headers
+    // 2. Map executable sections into memory
+    // 3. Set up initial stack with arguments
+    // 4. Set instruction pointer to entry point
+    // For now, we'll just mark the process as ready
+    
+    process.state = ProcessState::Ready;
+    
+    Ok(())
+}
+
+pub fn wait_for_process(pid: ProcessId) -> Result<i32, ()> {
+    let mut scheduler = SCHEDULER.lock();
+    let current_pid = scheduler.current_process;
+    
+    // Check if the target process exists
+    if !scheduler.processes.contains_key(&pid) {
+        return Err(()); // Process doesn't exist
+    }
+    
+    // Check if current process is parent of target process
+    let is_parent = scheduler.processes.get(&pid)
+        .map(|p| p.parent_pid == Some(current_pid))
+        .unwrap_or(false);
+    
+    if !is_parent {
+        return Err(()); // Can only wait for child processes
+    }
+    
+    // Check if process is already terminated
+    let target_state = scheduler.processes.get(&pid)
+        .map(|p| p.state.clone())
+        .unwrap_or(ProcessState::Terminated);
+    
+    match target_state {
+        ProcessState::Terminated => {
+            // Process already terminated, return exit code
+            let exit_code = scheduler.processes.get(&pid)
+                .map(|p| p.exit_code)
+                .unwrap_or(0);
+            
+            // Clean up the terminated process
+            scheduler.processes.remove(&pid);
+            crate::security::cleanup_process_security(pid);
+            
+            // Remove from parent's children list
+            if let Some(parent) = scheduler.processes.get_mut(&current_pid) {
+                parent.children.retain(|&child_pid| child_pid != pid);
+            }
+            
+            Ok(exit_code)
+        }
+        _ => {
+            // Process still running, block current process until it terminates
+            if let Some(current_process) = scheduler.processes.get_mut(&current_pid) {
+                current_process.state = ProcessState::Blocked;
+                current_process.waiting_for = Some(pid);
+            }
+            
+            // Remove current process from ready queue
+            scheduler.ready_queue.retain(|&p| p != current_pid);
+            
+            // In a real implementation, this would yield to scheduler
+            // For now, return a placeholder exit code
+            Ok(0)
+        }
+    }
+}
+
+pub fn get_process_count() -> u64 {
+    let scheduler = SCHEDULER.lock();
+    scheduler.processes.len() as u64
 }

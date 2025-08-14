@@ -24,4 +24,9 @@ macro_rules! serial_println {
     };
 }
 
+pub fn _print(args: core::fmt::Arguments) {
+    use core::fmt::Write;
+    let _ = SERIAL1.lock().write_fmt(args);
+}
+
 

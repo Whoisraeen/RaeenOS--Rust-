@@ -45,4 +45,53 @@ extern "C" {
     pub fn switch_context(old_context: *mut crate::process::ProcessContext, new_context: *const crate::process::ProcessContext);
 }
 
+// CPU core detection using CPUID
+pub fn get_cpu_count() -> u32 {
+    use x86_64::instructions::interrupts;
+    
+    // Disable interrupts during CPUID operations
+    interrupts::without_interrupts(|| {
+        // Check if CPUID supports leaf 0x0B (Extended Topology Enumeration)
+        let cpuid = raw_cpuid::CpuId::new();
+        
+        // Try extended topology enumeration first (Intel)
+        if let Some(topo_info) = cpuid.get_extended_topology_info() {
+            let mut max_cores = 1;
+            for level in topo_info {
+                if level.level_type() == raw_cpuid::TopologyType::Core {
+                    max_cores = level.processors();
+                    break;
+                }
+            }
+            return max_cores;
+        }
+        
+        // Fallback to basic CPUID leaf 1 and 4
+        if let Some(feature_info) = cpuid.get_feature_info() {
+            let logical_cores = feature_info.max_logical_processor_ids() as u32;
+            
+            // Try to get cores per package from cache info
+            if let Some(cache_info) = cpuid.get_cache_info() {
+                for cache in cache_info {
+                    if cache.cache_type() == raw_cpuid::CacheType::Data && cache.cache_level() == 1 {
+                        let cores_sharing = cache.max_cores_for_cache() + 1;
+                        if cores_sharing > 0 {
+                            return logical_cores / cores_sharing;
+                        }
+                    }
+                }
+            }
+            
+            // If hyperthreading is supported, assume 2 threads per core
+            if feature_info.has_htt() {
+                return logical_cores / 2;
+            }
+            
+            return logical_cores;
+        }
+        
+        // Ultimate fallback - assume single core
+        1
+    })
+}
 
