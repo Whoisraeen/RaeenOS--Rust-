@@ -37,6 +37,7 @@ impl VmPermissions {
     pub const Global: Self = Self(0x10);
     pub const NoCache: Self = Self(0x20);
     pub const WriteThrough: Self = Self(0x40);
+    pub const SWAPPABLE: Self = Self(0x80);
 }
 
 impl VmPermissions {
@@ -47,6 +48,8 @@ impl VmPermissions {
     pub fn executable(self) -> bool { (self.0 & Self::Execute.0) != 0 }
     
     pub fn user_accessible(self) -> bool { (self.0 & Self::User.0) != 0 }
+    
+    pub fn contains(self, other: Self) -> bool { (self.0 & other.0) == other.0 }
     
     pub fn to_page_table_flags(self) -> PageTableFlags {
         let mut flags = PageTableFlags::PRESENT;
@@ -889,7 +892,7 @@ pub fn defragment_memory(as_id: u64) -> VmResult<()> {
                 let old_page_addr = old_page + i;
                 let new_page_addr = new_page + i;
                 
-                if let Ok((frame, flags)) = mapper.translate_page(old_page_addr) {
+                if let Ok(_frame) = mapper.translate_page(old_page_addr) {
                     let _ = mapper.unmap(old_page_addr);
                     // Note: This is a simplified implementation - proper page moving would require more complex logic
                     // For now, we'll skip the actual remapping to avoid frame allocator access issues
@@ -913,27 +916,24 @@ pub fn compress_unused_pages(as_id: u64) -> VmResult<u64> {
     // Iterate through all areas to find pages that can be compressed
     for area in &mut address_space.areas {
         // Only compress pages in areas marked as compressible (swappable)
-        if area.permissions.contains(VmPermissions::SWAPPABLE) {
-            let start_page = Page::<Size4KiB>::containing_address(area.start);
-            let end_page = Page::<Size4KiB>::containing_address(area.end - 1u64);
+        if area.1.permissions.contains(VmPermissions::SWAPPABLE) {
+            let start_page = Page::<Size4KiB>::containing_address(area.1.start);
+            let end_page = Page::<Size4KiB>::containing_address(area.1.end - 1u64);
             
             memory::with_mapper(|mapper| {
                 for page in Page::range_inclusive(start_page, end_page) {
-                    if let Ok((frame, flags)) = mapper.translate_page(page) {
-                        // Check if page is accessed recently (clear accessed bit and check)
-                        if !flags.contains(PageTableFlags::ACCESSED) {
-                            // Page hasn't been accessed recently, candidate for compression
-                            // For now, we'll just unmap it to simulate compression
-                            if let Ok((_frame, flush)) = mapper.unmap(page) {
-                                flush.ignore(); // Batch TLB flush later
-                                bytes_saved += 4096; // One page saved
-                                
-                                // In a real implementation, we would:
-                                // 1. Read the page content
-                                // 2. Compress it using a compression algorithm
-                                // 3. Store compressed data in a swap area
-                                // 4. Mark the page as compressed in area metadata
-                            }
+                    if let Ok(_frame) = mapper.translate_page(page) {
+                        // For now, we'll just unmap it to simulate compression
+                        // In a real implementation, we would check if page was accessed recently
+                        if let Ok((_frame, flush)) = mapper.unmap(page) {
+                            flush.ignore(); // Batch TLB flush later
+                            bytes_saved += 4096; // One page saved
+                            
+                            // In a real implementation, we would:
+                            // 1. Read the page content
+                            // 2. Compress it using a compression algorithm
+                            // 3. Store compressed data in a swap area
+                            // 4. Mark the page as compressed in area metadata
                         }
                     }
                 }

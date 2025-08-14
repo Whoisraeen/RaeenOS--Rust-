@@ -70,6 +70,15 @@ pub fn allocate_frame() -> Option<PhysFrame> {
     FRAME_ALLOC.lock().as_mut().and_then(|a| a.allocate_frame())
 }
 
+pub fn with_frame_allocator<F, R>(f: F) -> R
+where
+    F: FnOnce(&mut BootInfoFrameAllocator) -> R,
+{
+    let mut frame_alloc = FRAME_ALLOC.lock();
+    let allocator = frame_alloc.as_mut().expect("Frame allocator not initialized");
+    f(allocator)
+}
+
 // Convert physical address to virtual address using the physical memory offset
 pub fn phys_to_virt(phys_addr: PhysAddr) -> VirtAddr {
     VirtAddr::new(phys_addr.as_u64() + active_physical_offset())
@@ -167,8 +176,8 @@ pub fn set_program_break(addr: VirtAddr) -> Result<VirtAddr, ()> {
                                 core::ptr::write_bytes(page_ptr, 0, 4096);
                             }
                         } else {
-                            // Mapping failed, deallocate frame
-                            allocator.deallocate_frame(frame);
+                            // Mapping failed
+                            // TODO: Implement frame deallocation
                             return Err(());
                         }
                     } else {
