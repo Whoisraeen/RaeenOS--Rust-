@@ -955,9 +955,9 @@ pub fn decompress_pages(as_id: u64) -> VmResult<()> {
     // Iterate through all areas to restore compressed pages
     for area in &mut address_space.areas {
         // Only decompress pages in areas that support compression
-        if area.permissions.contains(VmPermissions::SWAPPABLE) {
-            let start_page = Page::<Size4KiB>::containing_address(area.start);
-            let end_page = Page::<Size4KiB>::containing_address(area.end - 1u64);
+        if area.1.permissions.contains(VmPermissions::SWAPPABLE) {
+            let start_page = Page::<Size4KiB>::containing_address(area.1.start);
+            let end_page = Page::<Size4KiB>::containing_address(area.1.end - 1u64);
             
             memory::with_mapper(|mapper| {
                 for page in Page::range_inclusive(start_page, end_page) {
@@ -965,7 +965,7 @@ pub fn decompress_pages(as_id: u64) -> VmResult<()> {
                     if mapper.translate_page(page).is_err() {
                         // Page is not mapped, try to restore it
                         if let Some(frame) = memory::allocate_frame() {
-                            let flags = area.permissions.to_page_table_flags();
+                            let flags = area.1.permissions.to_page_table_flags();
                             
                             // Map the new frame with appropriate flags
                             if let Some(mut frame_alloc) = memory::FRAME_ALLOC.lock().as_mut() {
