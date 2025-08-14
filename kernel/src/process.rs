@@ -633,7 +633,7 @@ pub fn fork_process() -> Result<ProcessId, ()> {
     child_process.permissions = parent_process.permissions.clone();
     
     // Initialize security context for child process
-    let _ = crate::security::init_process_security(child_pid, Some(current_pid));
+    let _ = crate::security::init_process_security(child_pid as u32, Some(current_pid as u32));
     
     // Add the child process
     scheduler.add_process(child_process);
@@ -654,12 +654,12 @@ pub fn exec_process(path: &str, args: &[&str]) -> Result<(), ()> {
         .ok_or(())?;
     
     // Check if we have permission to execute files
-    if !crate::security::request_permission(current_pid, "file.execute").unwrap_or(false) {
+    if !crate::security::request_permission(current_pid as u32, "file.execute").unwrap_or(false) {
         return Err(());
     }
     
     // Validate the executable path
-    if !crate::security::check_path_access(current_pid, path, "execute").unwrap_or(false) {
+    if !crate::security::check_path_access(current_pid as u32, path, "execute").unwrap_or(false) {
         return Err(());
     }
     
@@ -733,7 +733,7 @@ pub fn wait_for_process(pid: ProcessId) -> Result<i32, ()> {
             if let Some(slot) = scheduler.processes.get_mut(pid as usize) {
                 *slot = None;
             }
-            crate::security::cleanup_process_security(pid);
+            crate::security::cleanup_process_security(pid as u32);
             
             Ok(exit_code)
         }

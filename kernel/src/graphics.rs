@@ -101,15 +101,7 @@ pub struct KeyboardEvent {
     pub timestamp: u64,
 }
 
-bitflags::bitflags! {
-    #[derive(Debug, Clone, Copy)]
-    pub struct KeyModifiers: u8 {
-        const SHIFT = 1 << 0;
-        const CTRL = 1 << 1;
-        const ALT = 1 << 2;
-        const META = 1 << 3;
-    }
-}
+
 
 #[derive(Debug, Clone)]
 pub enum WindowEvent {

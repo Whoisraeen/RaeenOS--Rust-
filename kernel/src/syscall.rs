@@ -257,7 +257,10 @@ fn sys_exec(path: u64, args: u64) -> SyscallResult {
         arg_vec.push(path_str.clone());
     }
     
-    match crate::process::exec_process(&path_str, &arg_vec) {
+    // Convert Vec<String> to Vec<&str>
+    let arg_strs: Vec<&str> = arg_vec.iter().map(|s| s.as_str()).collect();
+    
+    match crate::process::exec_process(&path_str, &arg_strs) {
         Ok(()) => {
             // exec doesn't return on success - the process image is replaced
             SyscallResult::success(0)
@@ -662,11 +665,21 @@ fn sys_play_sound(sound_id: u64, volume: u64, flags: u64) -> SyscallResult {
 fn sys_request_permission(permission: u64) -> SyscallResult {
     // Implement permission requesting
     let current_pid = match crate::process::get_current_process_info() {
-        Some((pid, _, _)) => pid,
+        Some((pid, _, _)) => pid as u32,
         None => return SyscallResult::error(SyscallError::ResourceNotFound)
     };
     
-    match crate::security::request_permission(current_pid, permission) {
+    // Convert permission u64 to string (simplified mapping)
+    let permission_str = match permission {
+        1 => "file.read",
+        2 => "file.write",
+        3 => "file.execute",
+        4 => "network.connect",
+        5 => "network.bind",
+        _ => "unknown"
+    };
+    
+    match crate::security::request_permission(current_pid, permission_str) {
         Ok(granted) => SyscallResult::success(if granted { 1 } else { 0 }),
         Err(_) => SyscallResult::error(SyscallError::PermissionDenied)
     }
@@ -675,7 +688,7 @@ fn sys_request_permission(permission: u64) -> SyscallResult {
 fn sys_set_sandbox(level: u64) -> SyscallResult {
     // Implement sandbox setting
     let current_pid = match crate::process::get_current_process_info() {
-        Some((pid, _, _)) => pid,
+        Some((pid, _, _)) => pid as u32,
         None => return SyscallResult::error(SyscallError::ResourceNotFound)
     };
     
@@ -688,7 +701,7 @@ fn sys_set_sandbox(level: u64) -> SyscallResult {
 fn sys_get_permissions(buffer: u64) -> SyscallResult {
     // Implement permission retrieval
     let current_pid = match crate::process::get_current_process_info() {
-        Some((pid, _, _)) => pid,
+        Some((pid, _, _)) => pid as u32,
         None => return SyscallResult::error(SyscallError::ResourceNotFound)
     };
     
