@@ -1,0 +1,81 @@
+# RaeenOS .gitignore
+
+# =========================
+# Rust/Cargo build outputs
+# =========================
+target/
+kernel/target/
+tools/build/target/
+
+# Common Rust artifacts
+**/*.rs.bk
+**/*.rlib
+**/*.rmeta
+
+# Native build artifacts
+**/*.o
+**/*.a
+**/*.so
+**/*.dll
+**/*.dylib
+**/*.exe
+**/*.lib
+**/*.pdb
+
+# =========================
+# QEMU/VM images & logs
+# (keep specific to root to avoid ignoring assets elsewhere)
+# =========================
+/*.iso
+/*.img
+/*.qcow
+/*.qcow2
+/*.vmdk
+/*.vdi
+qemu*.log
+QEMU*.log
+
+# =========================
+# Logs, dumps, and temp files
+# =========================
+*.log
+logs/
+*.dmp
+*.stackdump
+*.tmp
+*.temp
+*.bak
+*.old
+~$*
+*.swp
+*.swo
+
+# =========================
+# IDE/editor settings
+# (keep tracked rules/config dirs like .cargo, .cursor, .trae)
+# =========================
+.vscode/
+.idea/
+.vs/
+*.iml
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# =========================
+# OS-specific junk
+# =========================
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# =========================
+# Output directories
+# (avoid ignoring generic bin/; keep only common scratch dirs)
+# =========================
+dist/
+build/
+out/
+
+

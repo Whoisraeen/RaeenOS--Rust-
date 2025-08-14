@@ -9,7 +9,7 @@ use x86_64::VirtAddr;
 
 static DEVICE_MANAGER: RwLock<DeviceManager> = RwLock::new(DeviceManager::new());
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum DeviceType {
     Storage,
     Network,
@@ -227,7 +227,7 @@ impl Device for VgaDriver {
         unsafe {
             // Set text mode 80x25
             let mut misc_port = Port::new(0x3C2);
-            misc_port.write(0x67);
+            misc_port.write(0x67u8);
         }
         
         self.status = DeviceStatus::Ready;
@@ -300,7 +300,7 @@ impl AtaDriver {
             drive_port.write(if is_master { 0xA0 } else { 0xB0 });
             
             // Send IDENTIFY command
-            command_port.write(0xEC);
+            command_port.write(0xECu8);
             
             // Check if drive exists
             let status = status_port.read();
@@ -349,8 +349,8 @@ impl AtaDriver {
             let mut data_port = Port::new(base);
             
             // Set up LBA addressing
-            features_port.write(0);
-            sector_count_port.write(1);
+            features_port.write(0u8);
+            sector_count_port.write(1u8);
             lba_low_port.write((lba & 0xFF) as u8);
             lba_mid_port.write(((lba >> 8) & 0xFF) as u8);
             lba_high_port.write(((lba >> 16) & 0xFF) as u8);
@@ -359,7 +359,7 @@ impl AtaDriver {
             drive_port.write(drive_select | (((lba >> 24) & 0x0F) as u8));
             
             // Send READ SECTORS command
-            command_port.write(0x20);
+            command_port.write(0x20u8);
             
             // Wait for drive to be ready
             while (status_port.read() & 0x80) != 0 {} // Wait for BSY to clear
@@ -405,8 +405,8 @@ impl AtaDriver {
             let mut data_port = Port::new(base);
             
             // Set up LBA addressing
-            features_port.write(0);
-            sector_count_port.write(1);
+            features_port.write(0u8);
+            sector_count_port.write(1u8);
             lba_low_port.write((lba & 0xFF) as u8);
             lba_mid_port.write(((lba >> 8) & 0xFF) as u8);
             lba_high_port.write(((lba >> 16) & 0xFF) as u8);
@@ -469,9 +469,9 @@ impl Device for AtaDriver {
         // Reset ATA controller
         unsafe {
             let mut control_port = Port::new(self.primary_base + 0x206);
-            control_port.write(0x04); // Set reset bit
+            control_port.write(0x04u8); // Set reset bit
             crate::time::sleep_ms(5);
-            control_port.write(0x00); // Clear reset bit
+            control_port.write(0x00u8); // Clear reset bit
             crate::time::sleep_ms(5);
         }
         Ok(())
@@ -538,7 +538,7 @@ impl Ps2MouseDriver {
             while (status_port.read() & 0x02) != 0 {}
             
             // Send command to mouse
-            status_port.write(0xD4);
+            status_port.write(0xD4u8);
             while (status_port.read() & 0x02) != 0 {}
             data_port.write(command);
         }
