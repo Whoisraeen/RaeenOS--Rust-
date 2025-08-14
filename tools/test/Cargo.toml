@@ -1,0 +1,39 @@
+[package]
+name = "raeen-test"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Testing framework for RaeenOS"
+keywords = ["test", "os", "raeen"]
+categories = ["development-tools::testing"]
+
+[[bin]]
+name = "raeen-test"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+log.workspace = true
+env_logger.workspace = true
+walkdir.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+proptest = { workspace = true, optional = true }
+criterion.workspace = true
+mockall.workspace = true
+
+[features]
+default = ["unit", "integration", "performance", "fuzz"]
+unit = []
+integration = []
+performance = []
+fuzz = ["proptest"]
+kernel = []
+userspace = []
+compatibility = []

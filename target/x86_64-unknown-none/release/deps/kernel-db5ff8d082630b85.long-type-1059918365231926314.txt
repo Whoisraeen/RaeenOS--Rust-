@@ -1,0 +1,1 @@
+extern "x86-interrupt" fn(InterruptStackFrame, u64) {double_fault_handler}

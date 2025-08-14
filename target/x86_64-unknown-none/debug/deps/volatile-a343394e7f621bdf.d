@@ -1,0 +1,10 @@
+C:\Users\woisr\Documents\RaeenOS\target\x86_64-unknown-none\debug\deps\volatile-a343394e7f621bdf.d: C:\Users\woisr\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\volatile-0.5.4\src\lib.rs C:\Users\woisr\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\volatile-0.5.4\src\access.rs C:\Users\woisr\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\volatile-0.5.4\src\volatile_ptr\mod.rs C:\Users\woisr\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\volatile-0.5.4\src\volatile_ptr\macros.rs C:\Users\woisr\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\volatile-0.5.4\src\volatile_ptr\operations.rs C:\Users\woisr\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\volatile-0.5.4\src\volatile_ref.rs
+
+C:\Users\woisr\Documents\RaeenOS\target\x86_64-unknown-none\debug\deps\libvolatile-a343394e7f621bdf.rmeta: C:\Users\woisr\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\volatile-0.5.4\src\lib.rs C:\Users\woisr\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\volatile-0.5.4\src\access.rs C:\Users\woisr\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\volatile-0.5.4\src\volatile_ptr\mod.rs C:\Users\woisr\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\volatile-0.5.4\src\volatile_ptr\macros.rs C:\Users\woisr\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\volatile-0.5.4\src\volatile_ptr\operations.rs C:\Users\woisr\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\volatile-0.5.4\src\volatile_ref.rs
+
+C:\Users\woisr\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\volatile-0.5.4\src\lib.rs:
+C:\Users\woisr\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\volatile-0.5.4\src\access.rs:
+C:\Users\woisr\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\volatile-0.5.4\src\volatile_ptr\mod.rs:
+C:\Users\woisr\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\volatile-0.5.4\src\volatile_ptr\macros.rs:
+C:\Users\woisr\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\volatile-0.5.4\src\volatile_ptr\operations.rs:
+C:\Users\woisr\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\volatile-0.5.4\src\volatile_ref.rs:
