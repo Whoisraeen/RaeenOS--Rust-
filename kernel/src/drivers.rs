@@ -129,8 +129,11 @@ impl DeviceManager {
         self.devices.get(&id).map(|d| d.as_ref())
     }
     
-    pub fn get_device_mut(&mut self, id: u64) -> Option<&mut dyn Device> {
-        self.devices.get_mut(&id).map(|d| d.as_mut())
+    pub fn get_device_mut(&mut self, id: u64) -> Option<&mut (dyn Device + '_)> {
+        match self.devices.get_mut(&id) {
+            Some(device) => Some(device.as_mut()),
+            None => None,
+        }
     }
     
     pub fn get_devices_by_type(&self, device_type: DeviceType) -> Vec<u64> {
