@@ -3,8 +3,9 @@
 
 use alloc::vec;
 use alloc::vec::Vec;
-use alloc::string::String;
+use alloc::string::{String, ToString};
 use alloc::collections::BTreeMap;
+use x86_64::VirtAddr;
 use spin::Mutex;
 use lazy_static::lazy_static;
 use bitflags::bitflags;
@@ -737,6 +738,43 @@ impl WindowManager {
             }
         }
     }
+    
+    // Additional window management methods
+    pub fn set_focus(&mut self, window_id: u32) -> Result<(), &'static str> {
+        if self.focus_window(window_id) {
+            Ok(())
+        } else {
+            Err("Window not found")
+        }
+    }
+    
+    pub fn get_window_list(&self) -> alloc::vec::Vec<u32> {
+        self.windows.keys().copied().collect()
+    }
+    
+    pub fn resize_window(&mut self, window_id: u32, width: u32, height: u32) -> Result<(), &'static str> {
+        if let Some(window) = self.windows.get_mut(&window_id) {
+            window.rect.width = width;
+            window.rect.height = height;
+            
+            // Recreate window buffer with new size
+            window.buffer = Some(GraphicsBuffer::new(width, height));
+            
+            Ok(())
+        } else {
+            Err("Window not found")
+        }
+    }
+    
+    pub fn move_window(&mut self, window_id: u32, x: i32, y: i32) -> Result<(), &'static str> {
+        if let Some(window) = self.windows.get_mut(&window_id) {
+            window.rect.x = x;
+            window.rect.y = y;
+            Ok(())
+        } else {
+            Err("Window not found")
+        }
+    }
 }
 
 /// GPU acceleration interface
@@ -910,10 +948,209 @@ impl GpuAccelerator {
     }
 }
 
+/// Framebuffer compositor for hardware framebuffer access
+pub struct FramebufferCompositor {
+    framebuffer_addr: VirtAddr,
+    width: u32,
+    height: u32,
+    pitch: u32,
+    bpp: u32,
+    back_buffer: GraphicsBuffer,
+    front_buffer: GraphicsBuffer,
+    dirty_regions: Vec<Rect>,
+    vsync_enabled: bool,
+    frame_count: u64,
+    last_present_time: u64,
+}
+
+impl FramebufferCompositor {
+    pub fn new(framebuffer_addr: VirtAddr, width: u32, height: u32, pitch: u32, bpp: u32) -> Self {
+        Self {
+            framebuffer_addr,
+            width,
+            height,
+            pitch,
+            bpp,
+            back_buffer: GraphicsBuffer::new(width, height),
+            front_buffer: GraphicsBuffer::new(width, height),
+            dirty_regions: Vec::new(),
+            vsync_enabled: true,
+            frame_count: 0,
+            last_present_time: 0,
+        }
+    }
+    
+    /// Mark a region as dirty for partial updates
+    pub fn mark_dirty(&mut self, rect: Rect) {
+        self.dirty_regions.push(rect);
+    }
+    
+    /// Composite all windows to the back buffer
+    pub fn composite(&mut self, window_manager: &WindowManager) {
+        // Clear back buffer
+        self.back_buffer.clear(window_manager.theme.background_color);
+        
+        // Render windows in z-order
+        for &window_id in &window_manager.window_order {
+            if let Some(window) = window_manager.windows.get(&window_id) {
+                if window.visible {
+                    self.composite_window(window);
+                }
+            }
+        }
+    }
+    
+    /// Composite a single window to the back buffer
+    fn composite_window(&mut self, window: &Window) {
+        if let Some(window_buffer) = &window.buffer {
+            // Blit window buffer to back buffer with clipping
+            let src_rect = Rect::new(0, 0, window_buffer.width, window_buffer.height);
+            let dst_rect = window.rect;
+            
+            self.blit_with_clipping(window_buffer, src_rect, dst_rect);
+        }
+    }
+    
+    /// Blit with clipping support
+    fn blit_with_clipping(&mut self, src: &GraphicsBuffer, src_rect: Rect, dst_rect: Rect) {
+        let clip_rect = Rect::new(0, 0, self.width, self.height);
+        
+        // Calculate intersection
+        let x_start = core::cmp::max(dst_rect.x, clip_rect.x);
+        let y_start = core::cmp::max(dst_rect.y, clip_rect.y);
+        let x_end = core::cmp::min(dst_rect.x + dst_rect.width as i32, clip_rect.x + clip_rect.width as i32);
+        let y_end = core::cmp::min(dst_rect.y + dst_rect.height as i32, clip_rect.y + clip_rect.height as i32);
+        
+        if x_start >= x_end || y_start >= y_end {
+            return; // No intersection
+        }
+        
+        // Copy pixels
+        for y in y_start..y_end {
+            for x in x_start..x_end {
+                let src_x = (x - dst_rect.x) as u32;
+                let src_y = (y - dst_rect.y) as u32;
+                
+                if src_x < src.width && src_y < src.height {
+                    let src_index = (src_y * src.width + src_x) as usize;
+                    let dst_index = (y as u32 * self.width + x as u32) as usize;
+                    
+                    if src_index < src.pixels.len() && dst_index < self.back_buffer.pixels.len() {
+                        self.back_buffer.pixels[dst_index] = src.pixels[src_index];
+                    }
+                }
+            }
+        }
+    }
+    
+    /// Present the back buffer to the hardware framebuffer
+    pub fn present(&mut self) {
+        let current_time = get_timestamp();
+        
+        // Implement frame rate limiting for vsync
+        if self.vsync_enabled {
+            let target_frame_time = 16667; // ~60 FPS in microseconds
+            let elapsed = current_time.saturating_sub(self.last_present_time);
+            if elapsed < target_frame_time {
+                // Wait for vsync or target frame time
+                let wait_time = target_frame_time - elapsed;
+                self.wait_microseconds(wait_time);
+            }
+        }
+        
+        // Swap buffers - copy back buffer to front buffer
+        self.front_buffer.pixels.copy_from_slice(&self.back_buffer.pixels);
+        
+        if self.dirty_regions.is_empty() {
+            // Full screen update
+            self.present_full();
+        } else {
+            // Partial updates for better performance
+            self.present_partial();
+        }
+        
+        self.dirty_regions.clear();
+        self.frame_count += 1;
+        self.last_present_time = get_timestamp();
+    }
+    
+    /// Present the entire front buffer to hardware framebuffer
+    fn present_full(&self) {
+        unsafe {
+            let fb_ptr = self.framebuffer_addr.as_mut_ptr::<u32>();
+            
+            for y in 0..self.height {
+                for x in 0..self.width {
+                    let src_index = (y * self.width + x) as usize;
+                    let dst_index = (y * (self.pitch / 4) + x) as isize;
+                    
+                    if src_index < self.front_buffer.pixels.len() {
+                        *fb_ptr.offset(dst_index) = self.front_buffer.pixels[src_index];
+                    }
+                }
+            }
+        }
+    }
+    
+    /// Present only dirty regions
+    fn present_partial(&self) {
+        unsafe {
+            let fb_ptr = self.framebuffer_addr.as_mut_ptr::<u32>();
+            
+            for dirty_rect in &self.dirty_regions {
+                let x_start = core::cmp::max(0, dirty_rect.x) as u32;
+                let y_start = core::cmp::max(0, dirty_rect.y) as u32;
+                let x_end = core::cmp::min(self.width, (dirty_rect.x + dirty_rect.width as i32) as u32);
+                let y_end = core::cmp::min(self.height, (dirty_rect.y + dirty_rect.height as i32) as u32);
+                
+                for y in y_start..y_end {
+                    for x in x_start..x_end {
+                        let src_index = (y * self.width + x) as usize;
+                        let dst_index = (y * (self.pitch / 4) + x) as isize;
+                        
+                        if src_index < self.front_buffer.pixels.len() {
+                            *fb_ptr.offset(dst_index) = self.front_buffer.pixels[src_index];
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    /// Get the back buffer for direct rendering
+    pub fn get_back_buffer(&mut self) -> &mut GraphicsBuffer {
+        &mut self.back_buffer
+    }
+    
+    /// Wait for a specified number of microseconds (simple busy wait)
+    fn wait_microseconds(&self, microseconds: u64) {
+        let start = get_timestamp();
+        while get_timestamp().saturating_sub(start) < microseconds {
+            core::hint::spin_loop();
+        }
+    }
+    
+    /// Enable or disable vsync
+    pub fn set_vsync(&mut self, enabled: bool) {
+        self.vsync_enabled = enabled;
+    }
+    
+    /// Get frame statistics
+    pub fn get_frame_stats(&self) -> (u64, u64) {
+        (self.frame_count, self.last_present_time)
+    }
+    
+    /// Clear the back buffer with a specific color
+    pub fn clear_back_buffer(&mut self, color: Color) {
+        self.back_buffer.clear(color);
+    }
+}
+
 lazy_static! {
     static ref WINDOW_MANAGER: Mutex<WindowManager> = Mutex::new(WindowManager::new(1920, 1080));
     static ref GPU_ACCELERATOR: Mutex<GpuAccelerator> = Mutex::new(GpuAccelerator::new());
     static ref MAIN_BUFFER: Mutex<GraphicsBuffer> = Mutex::new(GraphicsBuffer::new(1920, 1080));
+    static ref FRAMEBUFFER_COMPOSITOR: Mutex<Option<FramebufferCompositor>> = Mutex::new(None);
 }
 
 // Public API functions
@@ -927,6 +1164,27 @@ pub fn init_graphics(screen_width: u32, screen_height: u32) -> Result<(), &'stat
     
     let mut buffer = MAIN_BUFFER.lock();
     *buffer = GraphicsBuffer::new(screen_width, screen_height);
+    
+    Ok(())
+}
+
+/// Initialize framebuffer compositor with hardware framebuffer
+pub fn init_framebuffer_compositor(
+    framebuffer_addr: VirtAddr, 
+    width: u32, 
+    height: u32, 
+    pitch: u32, 
+    bpp: u32
+) -> Result<(), &'static str> {
+    let mut compositor = FRAMEBUFFER_COMPOSITOR.lock();
+    *compositor = Some(FramebufferCompositor::new(framebuffer_addr, width, height, pitch, bpp));
+    
+    // Also update window manager and main buffer to match framebuffer
+    let mut wm = WINDOW_MANAGER.lock();
+    *wm = WindowManager::new(width, height);
+    
+    let mut buffer = MAIN_BUFFER.lock();
+    *buffer = GraphicsBuffer::new(width, height);
     
     Ok(())
 }
@@ -1002,39 +1260,215 @@ pub fn set_theme(theme: RaeTheme) {
 
 pub fn render_frame() {
     let wm = WINDOW_MANAGER.lock();
-    let mut buffer = MAIN_BUFFER.lock();
-    wm.render(&mut buffer);
     
-    // Present buffer to VGA text buffer region as a coarse preview
-    // Map RGBA to ASCII shade for now (very rough fallback display)
-    unsafe {
-        let vga_ptr = 0xb8000 as *mut u8;
-        let mut offset = 0usize;
-        let width = core::cmp::min(buffer.width, 80);
-        let height = core::cmp::min(buffer.height, 25);
-        for y in 0..height {
-            for x in 0..width {
-                let idx = (y * buffer.width + x) as usize;
-                let pix = buffer.pixels[idx];
-                let r = ((pix >> 16) & 0xFF) as u8;
-                let g = ((pix >> 8) & 0xFF) as u8;
-                let b = (pix & 0xFF) as u8;
-                let lum = (r as u16 + g as u16 + b as u16) / 3;
-                let ch = match lum {
-                    0..=25 => b' ', 26..=50 => b'.', 51..=90 => b'*', 91..=140 => b'o', 141..=200 => b'0', _ => b'@'
-                };
-                core::ptr::write_volatile(vga_ptr.add(offset), ch);
-                core::ptr::write_volatile(vga_ptr.add(offset + 1), 0x0f);
-                offset += 2;
-            }
-            // pad rest of line if any
-            while offset % (80 * 2) != 0 { 
-                core::ptr::write_volatile(vga_ptr.add(offset), b' ');
-                core::ptr::write_volatile(vga_ptr.add(offset + 1), 0x0f);
-                offset += 2;
+    // Check if we have a framebuffer compositor
+    let mut compositor_opt = FRAMEBUFFER_COMPOSITOR.lock();
+    if let Some(compositor) = compositor_opt.as_mut() {
+        // Use hardware framebuffer compositor
+        compositor.composite(&wm);
+        compositor.present();
+    } else {
+        // Fallback to software rendering
+        let mut buffer = MAIN_BUFFER.lock();
+        wm.render(&mut buffer);
+        
+        // Present buffer to VGA text buffer region as a coarse preview
+        // Map RGBA to ASCII shade for now (very rough fallback display)
+        unsafe {
+            let vga_ptr = 0xb8000 as *mut u8;
+            let mut offset = 0usize;
+            let width = core::cmp::min(buffer.width, 80);
+            let height = core::cmp::min(buffer.height, 25);
+            for y in 0..height {
+                for x in 0..width {
+                    let idx = (y * buffer.width + x) as usize;
+                    let pix = buffer.pixels[idx];
+                    let r = ((pix >> 16) & 0xFF) as u8;
+                    let g = ((pix >> 8) & 0xFF) as u8;
+                    let b = (pix & 0xFF) as u8;
+                    let lum = (r as u16 + g as u16 + b as u16) / 3;
+                    let ch = match lum {
+                        0..=25 => b' ', 26..=50 => b'.', 51..=90 => b'*', 91..=140 => b'o', 141..=200 => b'0', _ => b'@'
+                    };
+                    core::ptr::write_volatile(vga_ptr.add(offset), ch);
+                    core::ptr::write_volatile(vga_ptr.add(offset + 1), 0x0f);
+                    offset += 2;
+                }
+                // pad rest of line if any
+                while offset % (80 * 2) != 0 { 
+                    core::ptr::write_volatile(vga_ptr.add(offset), b' ');
+                    core::ptr::write_volatile(vga_ptr.add(offset + 1), 0x0f);
+                    offset += 2;
+                }
             }
         }
     }
+}
+
+/// Create a demo window to test the framebuffer compositor
+pub fn create_demo_window() -> Result<u32, &'static str> {
+    let mut wm = WINDOW_MANAGER.lock();
+    
+    // Create a demo window using the correct parameter order
+    let rect = Rect::new(100, 100, 400, 300);
+    let window_id = wm.create_window("Demo Window".to_string(), rect, 1);
+    
+    // Focus the window
+    wm.focus_window(window_id);
+    
+    // Get the window and draw some test content
+    if let Some(window) = wm.get_window_mut(window_id) {
+        if let Some(buffer) = &mut window.buffer {
+            // Fill window with a gradient background
+            for y in 0..buffer.height {
+                for x in 0..buffer.width {
+                    let r = (x * 255 / buffer.width) as u8;
+                    let g = (y * 255 / buffer.height) as u8;
+                    let b = 128u8;
+                    let color = Color::new(r, g, b, 255);
+                    buffer.set_pixel(x, y, color);
+                }
+            }
+            
+            // Draw a border
+            let border_color = Color::new(255, 255, 255, 255);
+            for x in 0..buffer.width {
+                buffer.set_pixel(x, 0, border_color);
+                buffer.set_pixel(x, buffer.height - 1, border_color);
+            }
+            for y in 0..buffer.height {
+                buffer.set_pixel(0, y, border_color);
+                buffer.set_pixel(buffer.width - 1, y, border_color);
+            }
+            
+            // Draw some test rectangles
+            let red_rect = Rect::new(50, 50, 100, 80);
+            let green_rect = Rect::new(200, 100, 120, 60);
+            
+            // Fill red rectangle
+            for y in red_rect.y..(red_rect.y + red_rect.height as i32) {
+                for x in red_rect.x..(red_rect.x + red_rect.width as i32) {
+                    if x >= 0 && y >= 0 && (x as u32) < buffer.width && (y as u32) < buffer.height {
+                        buffer.set_pixel(x as u32, y as u32, Color::new(255, 0, 0, 255));
+                    }
+                }
+            }
+            
+            // Fill green rectangle
+            for y in green_rect.y..(green_rect.y + green_rect.height as i32) {
+                for x in green_rect.x..(green_rect.x + green_rect.width as i32) {
+                    if x >= 0 && y >= 0 && (x as u32) < buffer.width && (y as u32) < buffer.height {
+                        buffer.set_pixel(x as u32, y as u32, Color::new(0, 255, 0, 255));
+                    }
+                }
+            }
+        }
+    }
+    
+    wm.focus_window(window_id);
+    Ok(window_id)
+}
+
+/// Create a boot animation window
+pub fn create_boot_window() -> Result<u32, &'static str> {
+    let mut wm = WINDOW_MANAGER.lock();
+    
+    let rect = Rect::new(200, 200, 600, 400);
+    let window_id = wm.create_window("RaeenOS Boot".to_string(), rect, 0);
+    
+    // Get the window and draw boot content
+    if let Some(window) = wm.get_window_mut(window_id) {
+        if let Some(buffer) = &mut window.buffer {
+            // Fill with dark blue background
+            let bg_color = Color::new(0, 17, 34, 255);
+            buffer.clear(bg_color);
+            
+            // Draw RaeenOS logo text (simplified)
+            let logo_color = Color::new(0, 102, 204, 255);
+            let logo_rect = Rect::new(200, 150, 200, 50);
+            
+            for y in logo_rect.y..(logo_rect.y + logo_rect.height as i32) {
+                for x in logo_rect.x..(logo_rect.x + logo_rect.width as i32) {
+                    if x >= 0 && y >= 0 && (x as u32) < buffer.width && (y as u32) < buffer.height {
+                        buffer.set_pixel(x as u32, y as u32, logo_color);
+                    }
+                }
+            }
+            
+            // Draw loading text
+            let loading_color = Color::new(255, 255, 255, 255);
+            let loading_rect = Rect::new(250, 220, 100, 20);
+            
+            for y in loading_rect.y..(loading_rect.y + loading_rect.height as i32) {
+                for x in loading_rect.x..(loading_rect.x + loading_rect.width as i32) {
+                    if x >= 0 && y >= 0 && (x as u32) < buffer.width && (y as u32) < buffer.height {
+                        buffer.set_pixel(x as u32, y as u32, loading_color);
+                    }
+                }
+            }
+        }
+    }
+    
+    wm.focus_window(window_id);
+    Ok(window_id)
+}
+
+/// Create a shell terminal window
+pub fn create_shell_window() -> Result<u32, &'static str> {
+    let mut wm = WINDOW_MANAGER.lock();
+    
+    let rect = Rect::new(50, 50, 800, 600);
+    let window_id = wm.create_window("RaeShell Terminal".to_string(), rect, 1);
+    
+    // Get the window and draw terminal content
+    if let Some(window) = wm.get_window_mut(window_id) {
+        if let Some(buffer) = &mut window.buffer {
+            // Fill with dark terminal background
+            let bg_color = Color::new(30, 30, 30, 255);
+            buffer.clear(bg_color);
+            
+            // Draw terminal prompt area
+            let prompt_color = Color::new(0, 122, 204, 255);
+            let prompt_rect = Rect::new(10, 550, 780, 30);
+            
+            for y in prompt_rect.y..(prompt_rect.y + prompt_rect.height as i32) {
+                for x in prompt_rect.x..(prompt_rect.x + prompt_rect.width as i32) {
+                    if x >= 0 && y >= 0 && (x as u32) < buffer.width && (y as u32) < buffer.height {
+                        buffer.set_pixel(x as u32, y as u32, prompt_color);
+                    }
+                }
+            }
+            
+            // Draw welcome text area
+            let text_color = Color::new(255, 255, 255, 255);
+            let text_rect = Rect::new(10, 10, 300, 30);
+            
+            for y in text_rect.y..(text_rect.y + text_rect.height as i32) {
+                for x in text_rect.x..(text_rect.x + text_rect.width as i32) {
+                    if x >= 0 && y >= 0 && (x as u32) < buffer.width && (y as u32) < buffer.height {
+                        buffer.set_pixel(x as u32, y as u32, text_color);
+                    }
+                }
+            }
+        }
+    }
+    
+    wm.focus_window(window_id);
+    Ok(window_id)
+}
+
+/// Update window manager state
+pub fn update_window_manager() {
+    let mut wm = WINDOW_MANAGER.lock();
+    
+    // Process pending events for all windows
+    for (_, window) in wm.windows.iter_mut() {
+        // Process window events (simplified)
+        window.pending_events.clear();
+    }
+    
+    // Update window animations, layouts, etc.
+    // This is where we would handle window transitions, animations, etc.
 }
 
 pub fn get_screen_buffer() -> &'static Mutex<GraphicsBuffer> {
@@ -1540,4 +1974,196 @@ pub fn invalidate_all_windows() {
     // Trigger a full screen refresh
     let mut buffer = MAIN_BUFFER.lock();
     buffer.clear(wm.theme.background_color);
+}
+
+// Enhanced graphics API functions
+pub fn set_vsync(enabled: bool) -> Result<(), &'static str> {
+    let mut compositor = FRAMEBUFFER_COMPOSITOR.lock();
+    if let Some(ref mut comp) = compositor.as_mut() {
+        comp.set_vsync(enabled);
+        return Ok(());
+    }
+    Err("Failed to access framebuffer compositor")
+}
+
+pub fn get_frame_stats() -> Result<(u64, u64), &'static str> {
+    let compositor = FRAMEBUFFER_COMPOSITOR.lock();
+    if let Some(ref comp) = compositor.as_ref() {
+        return Ok(comp.get_frame_stats());
+    }
+    Err("Failed to access framebuffer compositor")
+}
+
+pub fn clear_framebuffer(color: Color) -> Result<(), &'static str> {
+    let mut compositor = FRAMEBUFFER_COMPOSITOR.lock();
+    if let Some(ref mut comp) = compositor.as_mut() {
+        comp.clear_back_buffer(color);
+        return Ok(());
+    }
+    Err("Failed to access framebuffer compositor")
+}
+
+pub fn blit_buffer(src_data: &[u8], dst_x: u32, dst_y: u32, width: u32, height: u32, stride: u32) -> Result<(), &'static str> {
+    let mut compositor = FRAMEBUFFER_COMPOSITOR.lock();
+    if let Some(ref mut comp) = compositor.as_mut() {
+        let back_buffer = comp.get_back_buffer();
+        
+        // Perform bounds checking
+        if dst_x + width > back_buffer.width || dst_y + height > back_buffer.height {
+            return Err("Blit operation out of bounds");
+        }
+        
+        // Copy pixel data
+        for y in 0..height {
+            let src_offset = (y * stride) as usize;
+            
+            if src_offset + (width as usize * 4) <= src_data.len() {
+                for x in 0..width {
+                    let pixel_src_offset = src_offset + (x as usize * 4);
+                    if pixel_src_offset + 3 < src_data.len() {
+                        let b = src_data[pixel_src_offset];
+                        let g = src_data[pixel_src_offset + 1];
+                        let r = src_data[pixel_src_offset + 2];
+                        let a = src_data[pixel_src_offset + 3];
+                        let color = Color::new(r, g, b, a);
+                        back_buffer.set_pixel(dst_x + x, dst_y + y, color);
+                    }
+                }
+            }
+        }
+        
+        return Ok(());
+    }
+    Err("Failed to access framebuffer compositor")
+}
+
+pub fn set_input_focus(window_id: WindowId) -> Result<(), &'static str> {
+    let mut wm = WINDOW_MANAGER.lock();
+    wm.set_focus(window_id)
+}
+
+
+
+// Enhanced input handling functions
+pub fn show_help_overlay() {
+    // Create help overlay window
+    let mut wm = WINDOW_MANAGER.lock();
+    let rect = Rect::new(200, 150, 400, 300);
+    let window_id = wm.create_window("Help".to_string(), rect, 0);
+    
+    if let Some(window) = wm.get_window_mut(window_id) {
+        if let Some(buffer) = &mut window.buffer {
+            buffer.clear(Color::new(40, 40, 60, 240)); // Semi-transparent dark blue
+            
+            // Draw help text (simplified)
+            let help_text = "RaeenOS Help\n\nF1 - Show this help\nF2 - Performance overlay\nF3 - Task manager\nESC - Cancel";
+            // In a real implementation, this would render the text properly
+        }
+    }
+}
+
+pub fn toggle_performance_overlay() {
+    // Toggle performance metrics overlay
+    static mut OVERLAY_VISIBLE: bool = false;
+    unsafe {
+        OVERLAY_VISIBLE = !OVERLAY_VISIBLE;
+        if OVERLAY_VISIBLE {
+            // Show performance overlay
+            let mut wm = WINDOW_MANAGER.lock();
+            let rect = Rect::new(10, 10, 300, 150);
+            let window_id = wm.create_window("Performance".to_string(), rect, 0);
+            
+            if let Some(window) = wm.get_window_mut(window_id) {
+                if let Some(buffer) = &mut window.buffer {
+                    buffer.clear(Color::new(0, 0, 0, 180)); // Semi-transparent black
+                    // Performance metrics would be rendered here
+                }
+            }
+        }
+    }
+}
+
+pub fn create_task_manager_window() -> Result<u32, &'static str> {
+    let mut wm = WINDOW_MANAGER.lock();
+    let rect = Rect::new(150, 100, 500, 400);
+    let window_id = wm.create_window("Task Manager".to_string(), rect, 0);
+    
+    if let Some(window) = wm.get_window_mut(window_id) {
+        if let Some(buffer) = &mut window.buffer {
+            buffer.clear(Color::new(240, 240, 240, 255)); // Light gray background
+            // Task list would be rendered here
+        }
+    }
+    
+    Ok(window_id)
+}
+
+pub fn cancel_current_operation() {
+    // Cancel any ongoing operations (drag, resize, etc.)
+    static mut DRAG_STATE: Option<(u32, i32, i32)> = None;
+    unsafe {
+        DRAG_STATE = None;
+    }
+}
+
+pub fn update_cursor_position(x: i32, y: i32) {
+    // Update global cursor position
+    static mut CURSOR_POS: (i32, i32) = (0, 0);
+    unsafe {
+        CURSOR_POS = (x, y);
+    }
+}
+
+pub fn handle_window_drag(x: i32, y: i32, delta_x: i32, delta_y: i32) {
+    static mut DRAG_STATE: Option<(u32, i32, i32)> = None;
+    
+    unsafe {
+        if let Some((window_id, start_x, start_y)) = DRAG_STATE {
+            // Move window by delta
+            let _ = move_window(window_id, x - start_x, y - start_y);
+        }
+    }
+}
+
+pub fn handle_mouse_hover(x: i32, y: i32) {
+    // Handle mouse hover effects
+    let wm = WINDOW_MANAGER.lock();
+    if let Some(window_id) = wm.get_window_at_point(Point::new(x, y)) {
+        // Update hover state for window
+        // In a real implementation, this would update visual feedback
+    }
+}
+
+pub fn get_window_at_point(x: i32, y: i32) -> Option<u32> {
+    let wm = WINDOW_MANAGER.lock();
+    wm.get_window_at_point(Point::new(x, y))
+}
+
+pub fn start_window_drag_if_title_bar(x: i32, y: i32) {
+    let wm = WINDOW_MANAGER.lock();
+    if let Some(window_id) = wm.get_window_at_point(Point::new(x, y)) {
+        if let Some(window) = wm.get_window(window_id) {
+            // Check if click is in title bar area
+            let title_bar_rect = Rect::new(
+                window.rect.x,
+                window.rect.y - 30,
+                window.rect.width,
+                30
+            );
+            
+            if title_bar_rect.contains(Point::new(x, y)) {
+                static mut DRAG_STATE: Option<(u32, i32, i32)> = None;
+                unsafe {
+                    DRAG_STATE = Some((window_id, x - window.rect.x, y - window.rect.y));
+                }
+            }
+        }
+    }
+}
+
+pub fn end_window_drag() {
+    static mut DRAG_STATE: Option<(u32, i32, i32)> = None;
+    unsafe {
+        DRAG_STATE = None;
+    }
 }

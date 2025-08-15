@@ -14,30 +14,67 @@ lazy_static! {
         let stack_start = VirtAddr::from_ptr(unsafe { &STACK });
         let stack_end = stack_start + STACK_SIZE;
         tss.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] = stack_end;
+        
+        // Set up privilege level 0 stack for syscalls
+        tss.privilege_stack_table[0] = stack_end;
         tss
     };
 
     static ref GDT: (GlobalDescriptorTable, Selectors) = {
         let mut gdt = GlobalDescriptorTable::new();
-        let code_selector = gdt.add_entry(Descriptor::kernel_code_segment());
+        let kernel_code_selector = gdt.add_entry(Descriptor::kernel_code_segment());
+        let kernel_data_selector = gdt.add_entry(Descriptor::kernel_data_segment());
+        let user_code_selector = gdt.add_entry(Descriptor::user_code_segment());
+        let user_data_selector = gdt.add_entry(Descriptor::user_data_segment());
         let tss_selector = gdt.add_entry(Descriptor::tss_segment(&TSS));
-        (gdt, Selectors { code_selector, tss_selector })
+        (gdt, Selectors { 
+            kernel_code_selector, 
+            kernel_data_selector,
+            user_code_selector, 
+            user_data_selector,
+            tss_selector 
+        })
     };
 }
 
 pub struct Selectors {
-    pub code_selector: SegmentSelector,
+    pub kernel_code_selector: SegmentSelector,
+    pub kernel_data_selector: SegmentSelector,
+    pub user_code_selector: SegmentSelector,
+    pub user_data_selector: SegmentSelector,
     pub tss_selector: SegmentSelector,
 }
 
 pub fn init() {
-    use x86_64::instructions::segmentation::{CS, Segment};
+    use x86_64::instructions::segmentation::{CS, DS, ES, FS, GS, SS, Segment};
     use x86_64::instructions::tables::load_tss;
     GDT.0.load();
     unsafe {
-        CS::set_reg(GDT.1.code_selector);
+        CS::set_reg(GDT.1.kernel_code_selector);
+        DS::set_reg(GDT.1.kernel_data_selector);
+        ES::set_reg(GDT.1.kernel_data_selector);
+        FS::set_reg(GDT.1.kernel_data_selector);
+        GS::set_reg(GDT.1.kernel_data_selector);
+        SS::set_reg(GDT.1.kernel_data_selector);
         load_tss(GDT.1.tss_selector);
     }
+}
+
+// Helper functions for Ring3 transition
+pub fn get_user_code_selector() -> SegmentSelector {
+    GDT.1.user_code_selector
+}
+
+pub fn get_user_data_selector() -> SegmentSelector {
+    GDT.1.user_data_selector
+}
+
+pub fn get_kernel_code_selector() -> SegmentSelector {
+    GDT.1.kernel_code_selector
+}
+
+pub fn get_kernel_data_selector() -> SegmentSelector {
+    GDT.1.kernel_data_selector
 }
 
 

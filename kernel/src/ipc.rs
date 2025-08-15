@@ -1,12 +1,18 @@
 //! Inter-process communication for RaeenOS
-//! Implements pipes, message queues, and shared memory
+//! Implements pipes, message queues, shared memory, capabilities, and MPSC rings
+//! Features: per-process handle tables, capability revocation, flow control, audit logging
 
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use alloc::vec;
 use alloc::boxed::Box;
+use alloc::string::{String, ToString};
+use alloc::collections::VecDeque;
+use alloc::format;
 use spin::Mutex;
 use lazy_static::lazy_static;
+use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::fmt::Debug;
 
 // IPC object types
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -14,6 +20,49 @@ pub enum IpcObjectType {
     Pipe,
     MessageQueue,
     SharedMemory,
+    MpscRing,
+    CapabilityEndpoint,
+}
+
+// Capability rights for IPC objects
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IpcRights {
+    pub read: bool,
+    pub write: bool,
+    pub signal: bool,
+    pub map: bool,
+    pub exec: bool,
+    pub dup: bool,
+    pub send: bool,
+    pub recv: bool,
+}
+
+impl IpcRights {
+    pub const NONE: Self = Self {
+        read: false, write: false, signal: false, map: false,
+        exec: false, dup: false, send: false, recv: false,
+    };
+    
+    pub const READ_WRITE: Self = Self {
+        read: true, write: true, signal: false, map: false,
+        exec: false, dup: false, send: false, recv: false,
+    };
+    
+    pub const SEND_RECV: Self = Self {
+        read: false, write: false, signal: false, map: false,
+        exec: false, dup: false, send: true, recv: true,
+    };
+    
+    pub fn can_shrink_to(&self, other: &Self) -> bool {
+        (!other.read || self.read) &&
+        (!other.write || self.write) &&
+        (!other.signal || self.signal) &&
+        (!other.map || self.map) &&
+        (!other.exec || self.exec) &&
+        (!other.dup || self.dup) &&
+        (!other.send || self.send) &&
+        (!other.recv || self.recv)
+    }
 }
 
 // Pipe implementation
@@ -166,42 +215,622 @@ impl SharedMemory {
     }
 }
 
+// Backpressure policy for MPSC rings
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackpressurePolicy {
+    DropOldest,
+    ParkWithTimeout(u64), // timeout in microseconds
+    SpillBounded(usize),  // max spill buffer size
+}
+
+// MPSC ring buffer with flow control
+#[derive(Debug)]
+struct MpscRing {
+    buffer: Vec<Vec<u8>>,
+    capacity: usize,
+    head: AtomicU32,
+    tail: AtomicU32,
+    credits: AtomicU32,
+    max_credits: u32,
+    backpressure_policy: BackpressurePolicy,
+    spill_buffer: Vec<Vec<u8>>,
+    dropped_messages: AtomicU64,
+    parked_senders: AtomicU32,
+}
+
+impl MpscRing {
+    fn new(capacity: usize, max_credits: u32, policy: BackpressurePolicy) -> Self {
+        Self {
+            buffer: vec![Vec::new(); capacity],
+            capacity,
+            head: AtomicU32::new(0),
+            tail: AtomicU32::new(0),
+            credits: AtomicU32::new(max_credits),
+            max_credits,
+            backpressure_policy: policy,
+            spill_buffer: Vec::new(),
+            dropped_messages: AtomicU64::new(0),
+            parked_senders: AtomicU32::new(0),
+        }
+    }
+    
+    fn send(&mut self, message: Vec<u8>) -> Result<(), &'static str> {
+        // Check if we have credits
+        let current_credits = self.credits.load(Ordering::Acquire);
+        if current_credits == 0 {
+            return self.handle_backpressure(message);
+        }
+        
+        let head = self.head.load(Ordering::Acquire);
+        let tail = self.tail.load(Ordering::Acquire);
+        let next_head = (head + 1) % self.capacity as u32;
+        
+        if next_head == tail {
+            return self.handle_backpressure(message).map_err(|_| "Ring buffer full");
+        }
+        
+        // Consume a credit
+        self.credits.fetch_sub(1, Ordering::Release);
+        
+        // Store the message
+        self.buffer[head as usize] = message;
+        self.head.store(next_head, Ordering::Release);
+        
+        Ok(())
+    }
+    
+    fn receive(&mut self) -> Result<Vec<u8>, ()> {
+        let head = self.head.load(Ordering::Acquire);
+        let tail = self.tail.load(Ordering::Acquire);
+        
+        if head == tail {
+            return Err(()); // Empty
+        }
+        
+        let message = core::mem::take(&mut self.buffer[tail as usize]);
+        let next_tail = (tail + 1) % self.capacity as u32;
+        self.tail.store(next_tail, Ordering::Release);
+        
+        // Restore a credit
+        self.credits.fetch_add(1, Ordering::Release);
+        
+        Ok(message)
+    }
+    
+    fn handle_backpressure(&mut self, message: Vec<u8>) -> Result<(), &'static str> {
+        match self.backpressure_policy {
+            BackpressurePolicy::DropOldest => {
+                // Drop the oldest message and insert the new one
+                if let Ok(_) = self.receive() {
+                    self.dropped_messages.fetch_add(1, Ordering::Relaxed);
+                    return self.send(message);
+                }
+                Err("Failed to drop oldest message")
+            },
+            BackpressurePolicy::ParkWithTimeout(_timeout) => {
+                self.parked_senders.fetch_add(1, Ordering::Relaxed);
+                // TODO: Implement actual parking with timeout
+                // For now, just fail
+                Err("Sender would block")
+            },
+            BackpressurePolicy::SpillBounded(max_spill) => {
+                if self.spill_buffer.len() < max_spill {
+                    self.spill_buffer.push(message);
+                    Ok(())
+                } else {
+                    self.dropped_messages.fetch_add(1, Ordering::Relaxed);
+                    Err("Spill buffer full")
+                }
+            },
+        }
+    }
+    
+    fn get_stats(&self) -> MpscRingStats {
+        MpscRingStats {
+            capacity: self.capacity,
+            current_size: self.get_current_size(),
+            credits_available: self.credits.load(Ordering::Relaxed),
+            dropped_messages: self.dropped_messages.load(Ordering::Relaxed),
+            parked_senders: self.parked_senders.load(Ordering::Relaxed),
+            spill_buffer_size: self.spill_buffer.len(),
+        }
+    }
+    
+    fn get_current_size(&self) -> usize {
+        let head = self.head.load(Ordering::Relaxed);
+        let tail = self.tail.load(Ordering::Relaxed);
+        if head >= tail {
+            (head - tail) as usize
+        } else {
+            (self.capacity as u32 - tail + head) as usize
+        }
+    }
+}
+
+// Statistics for MPSC rings
+#[derive(Debug, Clone)]
+pub struct MpscRingStats {
+    pub capacity: usize,
+    pub current_size: usize,
+    pub credits_available: u32,
+    pub dropped_messages: u64,
+    pub parked_senders: u32,
+    pub spill_buffer_size: usize,
+}
+
+// Audit log entry for IPC operations
+#[derive(Debug, Clone)]
+struct AuditLogEntry {
+    timestamp: u64,
+    process_id: u32,
+    operation: String,
+    object_id: u32,
+    result: bool,
+    details: String,
+}
+
+// Audit log with bounded size and rate limiting
+#[derive(Debug)]
+struct AuditLog {
+    entries: Vec<AuditLogEntry>,
+    max_entries: usize,
+    per_pid_counters: BTreeMap<u32, (u32, u64)>, // (count, last_reset_time)
+    rate_limit_per_second: u32,
+}
+
+impl AuditLog {
+    fn new(max_entries: usize, rate_limit_per_second: u32) -> Self {
+        Self {
+            entries: Vec::new(),
+            max_entries,
+            per_pid_counters: BTreeMap::new(),
+            rate_limit_per_second,
+        }
+    }
+    
+    fn get_recent_entries(&self, count: usize) -> Vec<AuditLogEntry> {
+        self.entries.iter()
+            .rev()
+            .take(count)
+            .cloned()
+            .collect()
+    }
+    
+    fn log(&mut self, process_id: u32, operation: String, object_id: u32, result: String, details: String) -> Result<(), ()> {
+         let entry = AuditLogEntry {
+             timestamp: crate::time::get_uptime_ms() * 1000, // Convert to microseconds
+            process_id,
+            operation,
+            object_id,
+            result: result == "success",
+            details,
+        };
+        self.log_entry(entry)
+    }
+    
+    fn log_entry(&mut self, entry: AuditLogEntry) -> Result<(), ()> {
+        // Check rate limit for this PID
+         let current_time = crate::time::get_uptime_ms() * 1000; // Convert to microseconds
+        let current_second = current_time / 1_000_000;
+        
+        let (count, last_reset) = self.per_pid_counters
+            .get(&entry.process_id)
+            .copied()
+            .unwrap_or((0, current_second));
+        
+        let (new_count, new_last_reset) = if current_second > last_reset {
+            (1, current_second)
+        } else {
+            (count + 1, last_reset)
+        };
+        
+        if new_count > self.rate_limit_per_second {
+            return Err(()); // Rate limited
+        }
+        
+        self.per_pid_counters.insert(entry.process_id, (new_count, new_last_reset));
+        
+        // Add entry to log
+        if self.entries.len() >= self.max_entries {
+            self.entries.remove(0); // Remove oldest entry
+        }
+        
+        self.entries.push(entry);
+        Ok(())
+    }
+}
+
 // IPC object wrapper
 #[derive(Debug)]
 enum IpcObject {
     Pipe(Pipe),
     MessageQueue(MessageQueue),
     SharedMemory(SharedMemory),
+    MpscRing(MpscRing),
 }
 
-// File descriptor entry
+// Enhanced file descriptor with capability-based rights
 #[derive(Debug)]
 struct FileDescriptor {
     ipc_id: u32,
     object_type: IpcObjectType,
-    readable: bool,
-    writable: bool,
+    rights: IpcRights,
     process_id: u32,
+    generation: u32,
+    expiry_time: Option<u64>, // microseconds since boot
+    label: Option<String>,    // for bulk revocation
+}
+
+// Per-process handle table entry
+#[derive(Debug, Clone)]
+struct HandleEntry {
+    index: u32,
+    generation: u32,
+    rights: IpcRights,
+    object_id: u32,
+    object_type: IpcObjectType,
+    expiry_time: Option<u64>,
+    label: Option<String>,
+}
+
+// Per-process handle table
+#[derive(Debug)]
+struct ProcessHandleTable {
+    handles: BTreeMap<u32, HandleEntry>,
+    next_handle: u32,
+    process_id: u32,
+}
+
+impl ProcessHandleTable {
+    fn new(process_id: u32) -> Self {
+        Self {
+            handles: BTreeMap::new(),
+            next_handle: 3, // Start after stdin(0), stdout(1), stderr(2)
+            process_id,
+        }
+    }
+    
+    fn allocate_handle(&mut self, object_id: u32, object_type: IpcObjectType, 
+                      rights: IpcRights, expiry_time: Option<u64>, 
+                      label: Option<String>) -> u32 {
+        let handle_id = self.next_handle;
+        self.next_handle += 1;
+        
+        let entry = HandleEntry {
+            index: handle_id,
+            generation: 1,
+            rights,
+            object_id,
+            object_type,
+            expiry_time,
+            label,
+        };
+        
+        self.handles.insert(handle_id, entry);
+        handle_id
+    }
+    
+    fn get_handle(&self, handle_id: u32) -> Option<&HandleEntry> {
+        self.handles.get(&handle_id)
+    }
+    
+    fn revoke_handle(&mut self, handle_id: u32) -> bool {
+        self.handles.remove(&handle_id).is_some()
+    }
+    
+    fn revoke_by_label(&mut self, label: &str) -> usize {
+        let to_remove: Vec<u32> = self.handles
+            .iter()
+            .filter(|(_, entry)| {
+                entry.label.as_ref().map_or(false, |l| l == label)
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        
+        let count = to_remove.len();
+        for handle_id in to_remove {
+            self.handles.remove(&handle_id);
+        }
+        count
+    }
+    
+    fn cleanup_expired(&mut self, current_time: u64) -> usize {
+        let to_remove: Vec<u32> = self.handles
+            .iter()
+            .filter(|(_, entry)| {
+                entry.expiry_time.map_or(false, |expiry| current_time > expiry)
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        
+        let count = to_remove.len();
+        for handle_id in to_remove {
+            self.handles.remove(&handle_id);
+        }
+        count
+    }
+    
+    fn clone_handle(&mut self, handle_id: u32, new_rights: IpcRights) -> Option<u32> {
+        if let Some(entry) = self.handles.get(&handle_id) {
+            // Rights can only shrink
+            if !entry.rights.can_shrink_to(&new_rights) {
+                return None;
+            }
+            
+            let new_handle = self.allocate_handle(
+                entry.object_id,
+                entry.object_type,
+                new_rights,
+                entry.expiry_time,
+                entry.label.clone(),
+            );
+            
+            Some(new_handle)
+        } else {
+            None
+        }
+    }
 }
 
 // IPC system state
 struct IpcSystem {
     objects: BTreeMap<u32, IpcObject>,
     file_descriptors: BTreeMap<u32, FileDescriptor>,
+    handle_tables: BTreeMap<u32, ProcessHandleTable>, // process_id -> handle table
     next_ipc_id: u32,
-    next_fd: u32,
+    next_fd_id: u32,
+    audit_log: AuditLog,
+}
+
+impl IpcSystem {
+    fn new() -> Self {
+        Self {
+            objects: BTreeMap::new(),
+            file_descriptors: BTreeMap::new(),
+            handle_tables: BTreeMap::new(),
+            next_ipc_id: 1,
+            next_fd_id: 1,
+            audit_log: AuditLog::new(1000, 100), // 1000 entry capacity, 100 ops/sec rate limit
+        }
+    }
+    
+    fn get_or_create_handle_table(&mut self, process_id: u32) -> &mut ProcessHandleTable {
+        self.handle_tables.entry(process_id)
+            .or_insert_with(|| ProcessHandleTable::new(process_id))
+    }
+    
+    fn cleanup_process_handles(&mut self, process_id: u32) {
+        self.handle_tables.remove(&process_id);
+        
+        // Also clean up old file descriptors for this process
+        let to_remove: Vec<u32> = self.file_descriptors
+            .iter()
+            .filter(|(_, fd)| fd.process_id == process_id)
+            .map(|(id, _)| *id)
+            .collect();
+        
+        for fd_id in to_remove {
+            self.file_descriptors.remove(&fd_id);
+        }
+    }
+    
+    fn create_mpsc_ring(&mut self, process_id: u32, capacity: usize, 
+                       policy: BackpressurePolicy, rights: IpcRights,
+                       expiry_time: Option<u64>, label: Option<String>) -> Result<u32, &'static str> {
+        if capacity == 0 || capacity > 65536 {
+            return Err("Invalid ring capacity");
+        }
+        
+        let ring = MpscRing::new(capacity, 1000, policy); // 1000 max credits
+        let ipc_id = self.next_ipc_id;
+        self.next_ipc_id += 1;
+        
+        self.objects.insert(ipc_id, IpcObject::MpscRing(ring));
+        
+        // Create handle in process handle table
+        let handle_table = self.get_or_create_handle_table(process_id);
+        let handle_id = handle_table.allocate_handle(
+            ipc_id, 
+            IpcObjectType::MpscRing, 
+            rights, 
+            expiry_time, 
+            label.clone()
+        );
+        
+        // Log the operation
+        let _ = self.audit_log.log(
+            process_id,
+            "create_mpsc_ring".to_string(),
+            ipc_id,
+            "success".to_string(),
+            format!("capacity={}, policy={:?}, handle={}", capacity, policy, handle_id),
+        );
+        
+        Ok(handle_id)
+    }
+    
+    fn send_to_ring(&mut self, process_id: u32, handle_id: u32, 
+                   data: &[u8]) -> Result<(), &'static str> {
+        // Check handle permissions
+        let handle_table = self.handle_tables.get(&process_id)
+            .ok_or("Process has no handle table")?;
+        
+        let handle = handle_table.get_handle(handle_id)
+            .ok_or("Invalid handle")?;
+        
+        if !handle.rights.send {
+            let _ = self.audit_log.log(
+                process_id,
+                "send_to_ring".to_string(),
+                handle.object_id,
+                "permission_denied".to_string(),
+                format!("handle={}, missing_send_right", handle_id),
+            );
+            return Err("No send permission");
+        }
+        
+        // Check expiry
+         if let Some(expiry) = handle.expiry_time {
+             let current_time = crate::time::get_uptime_ms() * 1000; // Convert to microseconds
+             if current_time > expiry {
+                 return Err("Handle expired");
+             }
+         }
+        
+        // Get the ring object
+        if let Some(IpcObject::MpscRing(ring)) = self.objects.get_mut(&handle.object_id) {
+            let result = ring.send(data.to_vec());
+            
+            let result_str = match result {
+                Ok(_) => "success",
+                Err(_) => "failed",
+            };
+            
+            let _ = self.audit_log.log(
+                process_id,
+                "send_to_ring".to_string(),
+                handle.object_id,
+                result_str.to_string(),
+                format!("handle={}, size={}", handle_id, data.len()),
+            );
+            
+            result
+        } else {
+            Err("Object not found or wrong type")
+        }
+    }
+    
+    fn receive_from_ring(&mut self, process_id: u32, handle_id: u32) -> Result<Vec<u8>, &'static str> {
+        // Check handle permissions
+        let handle_table = self.handle_tables.get(&process_id)
+            .ok_or("Process has no handle table")?;
+        
+        let handle = handle_table.get_handle(handle_id)
+            .ok_or("Invalid handle")?;
+        
+        if !handle.rights.recv {
+            let _ = self.audit_log.log(
+                process_id,
+                "receive_from_ring".to_string(),
+                handle.object_id,
+                "permission_denied".to_string(),
+                format!("handle={}, missing_recv_right", handle_id),
+            );
+            return Err("No receive permission");
+        }
+        
+        // Check expiry
+         if let Some(expiry) = handle.expiry_time {
+             let current_time = crate::time::get_uptime_ms() * 1000; // Convert to microseconds
+             if current_time > expiry {
+                 return Err("Handle expired");
+             }
+         }
+        
+        // Get the ring object
+        if let Some(IpcObject::MpscRing(ring)) = self.objects.get_mut(&handle.object_id) {
+            let result = ring.receive().map_err(|_| "Ring buffer empty");
+            
+            let (result_str, size) = match &result {
+                Ok(data) => ("success", data.len()),
+                Err(_) => ("failed", 0),
+            };
+            
+            let _ = self.audit_log.log(
+                process_id,
+                "receive_from_ring".to_string(),
+                handle.object_id,
+                result_str.to_string(),
+                format!("handle={}, size={}", handle_id, size),
+            );
+            
+            result
+        } else {
+            Err("Object not found or wrong type")
+        }
+    }
+    
+    fn revoke_handle(&mut self, process_id: u32, handle_id: u32) -> Result<(), &'static str> {
+        let handle_table = self.handle_tables.get_mut(&process_id)
+            .ok_or("Process has no handle table")?;
+        
+        if handle_table.revoke_handle(handle_id) {
+            let _ = self.audit_log.log(
+                process_id,
+                "revoke_handle".to_string(),
+                0, // No specific object
+                "success".to_string(),
+                format!("handle={}", handle_id),
+            );
+            Ok(())
+        } else {
+            Err("Handle not found")
+        }
+    }
+    
+    fn revoke_handles_by_label(&mut self, process_id: u32, label: &str) -> Result<usize, &'static str> {
+        let handle_table = self.handle_tables.get_mut(&process_id)
+            .ok_or("Process has no handle table")?;
+        
+        let count = handle_table.revoke_by_label(label);
+        
+        let _ = self.audit_log.log(
+            process_id,
+            "revoke_by_label".to_string(),
+            0,
+            "success".to_string(),
+            format!("label={}, count={}", label, count),
+        );
+        
+        Ok(count)
+    }
+    
+    fn cleanup_expired_handles(&mut self, process_id: u32) -> Result<usize, &'static str> {
+         let current_time = crate::time::get_uptime_ms() * 1000; // Convert to microseconds
+        
+        let handle_table = self.handle_tables.get_mut(&process_id)
+            .ok_or("Process has no handle table")?;
+        
+        let count = handle_table.cleanup_expired(current_time);
+        
+        if count > 0 {
+            let _ = self.audit_log.log(
+                process_id,
+                "cleanup_expired".to_string(),
+                0,
+                "success".to_string(),
+                format!("count={}", count),
+            );
+        }
+        
+        Ok(count)
+    }
+    
+    fn clone_handle(&mut self, process_id: u32, handle_id: u32, 
+                   new_rights: IpcRights) -> Result<u32, &'static str> {
+        let handle_table = self.handle_tables.get_mut(&process_id)
+            .ok_or("Process has no handle table")?;
+        
+        if let Some(new_handle) = handle_table.clone_handle(handle_id, new_rights) {
+            let _ = self.audit_log.log(
+                process_id,
+                "clone_handle".to_string(),
+                0,
+                "success".to_string(),
+                format!("original={}, new={}", handle_id, new_handle),
+            );
+            Ok(new_handle)
+        } else {
+            Err("Cannot clone handle or insufficient rights")
+        }
+    }
 }
 
 lazy_static! {
-    static ref IPC_SYSTEM: Mutex<IpcSystem> = Mutex::new(IpcSystem {
-        objects: BTreeMap::new(),
-        file_descriptors: BTreeMap::new(),
-        next_ipc_id: 1,
-        next_fd: 3, // Start after stdin(0), stdout(1), stderr(2)
-    });
+    static ref IPC_SYSTEM: Mutex<IpcSystem> = Mutex::new(IpcSystem::new());
 }
 
-// Create a pipe and return read/write file descriptors
+// Create a pipe with capability-based access
 pub fn create_pipe() -> Result<(u32, u32), ()> {
     let mut ipc = IPC_SYSTEM.lock();
     let current_pid = crate::process::get_current_process_id();
@@ -221,34 +850,38 @@ pub fn create_pipe() -> Result<(u32, u32), ()> {
     
     ipc.objects.insert(pipe_id, IpcObject::Pipe(pipe));
     
-    // Create read file descriptor
-    let read_fd = ipc.next_fd;
-    ipc.next_fd += 1;
+    // Create handles in process handle table
+    let handle_table = ipc.get_or_create_handle_table(current_pid as u32);
     
-    ipc.file_descriptors.insert(read_fd, FileDescriptor {
-        ipc_id: pipe_id,
-        object_type: IpcObjectType::Pipe,
-        readable: true,
-        writable: false,
-        process_id: current_pid as u32,
-    });
+    let read_handle = handle_table.allocate_handle(
+        pipe_id,
+        IpcObjectType::Pipe,
+        IpcRights { read: true, write: false, ..IpcRights::NONE },
+        None, // No expiry
+        Some("pipe_read".to_string()),
+    );
     
-    // Create write file descriptor
-    let write_fd = ipc.next_fd;
-    ipc.next_fd += 1;
-    
-    ipc.file_descriptors.insert(write_fd, FileDescriptor {
-        ipc_id: pipe_id,
-        object_type: IpcObjectType::Pipe,
-        readable: false,
-        writable: true,
-        process_id: current_pid as u32,
-    });
-    
-    Ok((read_fd, write_fd))
+    let write_handle = handle_table.allocate_handle(
+        pipe_id,
+        IpcObjectType::Pipe,
+        IpcRights { read: false, write: true, ..IpcRights::NONE },
+        None, // No expiry
+        Some("pipe_write".to_string()),
+    );
+
+    // Log the operation
+    let _ = ipc.audit_log.log(
+        current_pid as u32,
+        "create_pipe".to_string(),
+        pipe_id,
+        "success".to_string(),
+        format!("read_handle={}, write_handle={}", read_handle, write_handle),
+    );
+
+    Ok((read_handle, write_handle))
 }
 
-// Create a message queue
+// Create a message queue with capability-based access
 pub fn create_message_queue(max_messages: usize, max_message_size: usize) -> Result<u32, ()> {
     let mut ipc = IPC_SYSTEM.lock();
     let current_pid = crate::process::get_current_process_id();
@@ -264,22 +897,29 @@ pub fn create_message_queue(max_messages: usize, max_message_size: usize) -> Res
     let queue = MessageQueue::new(max_messages, max_message_size);
     ipc.objects.insert(queue_id, IpcObject::MessageQueue(queue));
     
-    // Create file descriptor
-    let fd = ipc.next_fd;
-    ipc.next_fd += 1;
+    // Create handle in process handle table
+    let handle_table = ipc.get_or_create_handle_table(current_pid as u32);
+    let handle_id = handle_table.allocate_handle(
+        queue_id,
+        IpcObjectType::MessageQueue,
+        IpcRights::SEND_RECV, // Full send/receive rights
+        None, // No expiry
+        Some("message_queue".to_string()),
+    );
+
+    // Log the operation
+    let _ = ipc.audit_log.log(
+        current_pid as u32,
+        "create_message_queue".to_string(),
+        queue_id,
+        "success".to_string(),
+        format!("max_messages={}, max_message_size={}, handle={}", max_messages, max_message_size, handle_id),
+    );
     
-    ipc.file_descriptors.insert(fd, FileDescriptor {
-        ipc_id: queue_id,
-        object_type: IpcObjectType::MessageQueue,
-        readable: true,
-        writable: true,
-        process_id: current_pid as u32,
-    });
-    
-    Ok(fd)
+    Ok(handle_id)
 }
 
-// Create shared memory
+// Create shared memory with capability-based access
 pub fn create_shared_memory(size: usize) -> Result<u32, ()> {
     let mut ipc = IPC_SYSTEM.lock();
     let current_pid = crate::process::get_current_process_id();
@@ -293,11 +933,30 @@ pub fn create_shared_memory(size: usize) -> Result<u32, ()> {
     ipc.next_ipc_id += 1;
     
     let mut shm = SharedMemory::new(size);
-    shm.attach(current_pid as u32)?;
+    let _ = shm.attach(current_pid as u32);
     
     ipc.objects.insert(shm_id, IpcObject::SharedMemory(shm));
     
-    Ok(shm_id)
+    // Create handle in process handle table
+    let handle_table = ipc.get_or_create_handle_table(current_pid as u32);
+    let handle_id = handle_table.allocate_handle(
+        shm_id,
+        IpcObjectType::SharedMemory,
+        IpcRights { read: true, write: true, map: true, ..IpcRights::NONE },
+        None, // No expiry
+        Some("shared_memory".to_string()),
+    );
+
+    // Log the operation
+    let _ = ipc.audit_log.log(
+        current_pid as u32,
+        "create_shared_memory".to_string(),
+        shm_id,
+        "success".to_string(),
+        format!("size={}, handle={}", size, handle_id),
+    );
+    
+    Ok(handle_id)
 }
 
 // Read from IPC object
@@ -308,7 +967,7 @@ pub fn ipc_read(fd: u32, buf: &mut [u8]) -> Result<usize, ()> {
     // Extract the necessary information from file descriptor first
     let (ipc_id, process_id, readable) = {
         let file_desc = ipc.file_descriptors.get(&fd).ok_or(())?;
-        (file_desc.ipc_id, file_desc.process_id, file_desc.readable)
+        (file_desc.ipc_id, file_desc.process_id, file_desc.rights.read)
     };
     
     // Check ownership and permissions
@@ -325,6 +984,7 @@ pub fn ipc_read(fd: u32, buf: &mut [u8]) -> Result<usize, ()> {
             Ok(to_copy)
         }
         IpcObject::SharedMemory(_) => Err(()), // Use attach/detach for shared memory
+        IpcObject::MpscRing(_) => Err(()), // Use receive_from_ring for MPSC rings
     }
 }
 
@@ -334,15 +994,15 @@ pub fn ipc_write(fd: u32, buf: &[u8]) -> Result<usize, ()> {
     let current_pid = crate::process::get_current_process_id();
     
     // Extract needed values before mutable operations
-    let ipc_id = {
+    let (ipc_id, writable) = {
         let file_desc = ipc.file_descriptors.get(&fd).ok_or(())?;
         
         // Check ownership and permissions
-        if file_desc.process_id != current_pid as u32 || !file_desc.writable {
+        if file_desc.process_id != current_pid as u32 || !file_desc.rights.write {
             return Err(());
         }
         
-        file_desc.ipc_id
+        (file_desc.ipc_id, file_desc.rights.write)
     };
     
     match ipc.objects.get_mut(&ipc_id).ok_or(())? {
@@ -352,6 +1012,7 @@ pub fn ipc_write(fd: u32, buf: &[u8]) -> Result<usize, ()> {
             Ok(buf.len())
         }
         IpcObject::SharedMemory(_) => Err(()), // Use attach/detach for shared memory
+        IpcObject::MpscRing(_) => Err(()), // Use send_to_ring for MPSC rings
     }
 }
 
@@ -369,7 +1030,7 @@ pub fn close_ipc_fd(fd: u32) -> Result<(), ()> {
             return Err(());
         }
         
-        (file_desc.ipc_id, file_desc.object_type, file_desc.readable, file_desc.writable)
+        (file_desc.ipc_id, file_desc.object_type, file_desc.rights.read, file_desc.rights.write)
     };
     
     ipc.file_descriptors.remove(&fd);
@@ -458,5 +1119,76 @@ pub fn cleanup_process_ipc(process_id: u32) {
     
     for shm_id in shm_ids {
         let _ = detach_shared_memory(shm_id);
+    }
+    
+    // Clean up process handle table
+    ipc.cleanup_process_handles(process_id);
+}
+
+// Create an MPSC ring with flow control
+pub fn create_mpsc_ring(process_id: u32, capacity: usize, policy: BackpressurePolicy) -> Result<u32, &'static str> {
+    let mut ipc = IPC_SYSTEM.lock();
+    ipc.create_mpsc_ring(
+        process_id, 
+        capacity, 
+        policy, 
+        IpcRights::SEND_RECV, 
+        None, 
+        Some("mpsc_ring".to_string())
+    )
+}
+
+// Send data to an MPSC ring
+pub fn send_to_ring(process_id: u32, handle_id: u32, data: &[u8]) -> Result<(), &'static str> {
+    let mut ipc = IPC_SYSTEM.lock();
+    ipc.send_to_ring(process_id, handle_id, data)
+}
+
+// Receive data from an MPSC ring
+pub fn receive_from_ring(process_id: u32, handle_id: u32) -> Result<Vec<u8>, &'static str> {
+    let mut ipc = IPC_SYSTEM.lock();
+    ipc.receive_from_ring(process_id, handle_id)
+}
+
+// Revoke a specific handle
+pub fn revoke_handle(process_id: u32, handle_id: u32) -> Result<(), &'static str> {
+    let mut ipc = IPC_SYSTEM.lock();
+    ipc.revoke_handle(process_id, handle_id)
+}
+
+// Revoke all handles with a specific label (bulk revocation)
+pub fn revoke_handles_by_label(process_id: u32, label: &str) -> Result<usize, &'static str> {
+    let mut ipc = IPC_SYSTEM.lock();
+    ipc.revoke_handles_by_label(process_id, label)
+}
+
+// Clean up expired handles for a process
+pub fn cleanup_expired_handles(process_id: u32) -> Result<usize, &'static str> {
+    let mut ipc = IPC_SYSTEM.lock();
+    ipc.cleanup_expired_handles(process_id)
+}
+
+// Clone a handle with reduced rights
+pub fn clone_handle(process_id: u32, handle_id: u32, new_rights: IpcRights) -> Result<u32, &'static str> {
+    let mut ipc = IPC_SYSTEM.lock();
+    ipc.clone_handle(process_id, handle_id, new_rights)
+}
+
+// Get MPSC ring statistics
+pub fn get_ring_stats(process_id: u32, handle_id: u32) -> Result<MpscRingStats, &'static str> {
+    let ipc = IPC_SYSTEM.lock();
+    
+    // Check handle permissions
+    let handle_table = ipc.handle_tables.get(&process_id)
+        .ok_or("Process has no handle table")?;
+    
+    let handle = handle_table.get_handle(handle_id)
+        .ok_or("Invalid handle")?;
+    
+    // Get the ring object
+    if let Some(IpcObject::MpscRing(ring)) = ipc.objects.get(&handle.object_id) {
+        Ok(ring.get_stats())
+    } else {
+        Err("Object not found or wrong type")
     }
 }

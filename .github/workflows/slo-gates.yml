@@ -1,0 +1,203 @@
+name: SLO Gates
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+  schedule:
+    # Run SLO tests daily at 2 AM UTC
+    - cron: '0 2 * * *'
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  slo-testing:
+    name: SLO Testing on ${{ matrix.sku }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        sku: ["desk-sku-a", "lap-sku-b"]
+      fail-fast: false
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0  # Need full history for drift analysis
+    
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        toolchain: nightly
+        components: rust-src, llvm-tools-preview
+    
+    - name: Cache Cargo dependencies
+      uses: actions/cache@v3
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-
+    
+    - name: Install QEMU
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y qemu-system-x86
+    
+    - name: Build RaeenOS
+      run: |
+        cd kernel
+        cargo build --release
+    
+    - name: Run SLO Test Suite
+      id: slo_tests
+      run: |
+        cargo run --bin raeen-test -- slo --sku ${{ matrix.sku }} --output slo_results_${{ matrix.sku }}.json --verbose
+      continue-on-error: true
+    
+    - name: Upload SLO Results
+      uses: actions/upload-artifact@v3
+      with:
+        name: slo-results-${{ matrix.sku }}-${{ github.sha }}
+        path: slo_results_${{ matrix.sku }}.json
+        retention-days: 30
+    
+    - name: Validate SLO Results Schema
+      run: |
+        # Install JSON schema validator
+        pip install jsonschema
+        
+        # Validate against schema
+        python -c "
+        import json
+        import jsonschema
+        
+        # Load schema
+        with open('Docs/CI/slo_results.schema.json', 'r') as f:
+            schema = json.load(f)
+        
+        # Load results
+        with open('slo_results_${{ matrix.sku }}.json', 'r') as f:
+            results = json.load(f)
+        
+        # Validate
+        jsonschema.validate(results, schema)
+        print('✅ SLO results schema validation passed')
+        "
+    
+    - name: Check SLO Gate Compliance
+      id: gate_check
+      run: |
+        python .github/scripts/slo_gate_check.py \
+          --results slo_results_${{ matrix.sku }}.json \
+          --sku ${{ matrix.sku }} \
+          --github-token ${{ secrets.GITHUB_TOKEN }} \
+          --repo ${{ github.repository }} \
+          --sha ${{ github.sha }}
+    
+    - name: Comment PR with SLO Results
+      if: github.event_name == 'pull_request'
+      uses: actions/github-script@v6
+      with:
+        script: |
+          const fs = require('fs');
+          const path = `slo_results_${{ matrix.sku }}.json`;
+          
+          if (fs.existsSync(path)) {
+            const results = JSON.parse(fs.readFileSync(path, 'utf8'));
+            const metrics = Object.entries(results.metrics)
+              .map(([key, value]) => `- ${key}: ${value.toFixed(3)}µs`)
+              .join('\n');
+            
+            const comment = `## SLO Test Results - ${{ matrix.sku }}
+            
+            Platform: ${results.platform}
+            
+            ### Metrics:
+            ${metrics}
+            
+            Status: ${{ steps.slo_tests.outcome === 'success' ? '✅ PASS' : '❌ FAIL' }}
+            `;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: comment
+            });
+          }
+    
+    - name: Fail job if SLO gates not met
+      if: steps.slo_tests.outcome != 'success'
+      run: |
+        echo "❌ SLO gates failed for ${{ matrix.sku }}"
+        exit 1
+
+  slo-gate-summary:
+    name: SLO Gate Summary
+    runs-on: ubuntu-latest
+    needs: slo-testing
+    if: always()
+    
+    steps:
+    - name: Download all SLO results
+      uses: actions/download-artifact@v3
+      with:
+        path: slo-results
+    
+    - name: Generate SLO Summary Report
+      run: |
+        echo "# SLO Gate Summary Report" > slo_summary.md
+        echo "" >> slo_summary.md
+        echo "**Commit:** ${{ github.sha }}" >> slo_summary.md
+        echo "**Timestamp:** $(date -u)" >> slo_summary.md
+        echo "" >> slo_summary.md
+        
+        # Process each SKU result
+        for sku_dir in slo-results/slo-results-*; do
+          if [ -d "$sku_dir" ]; then
+            sku_name=$(basename "$sku_dir" | sed 's/slo-results-//' | sed 's/-[^-]*$//')
+            echo "## $sku_name" >> slo_summary.md
+            
+            for result_file in "$sku_dir"/*.json; do
+              if [ -f "$result_file" ]; then
+                echo "Processing $result_file"
+                python -c "
+        import json
+        import sys
+        
+        with open('$result_file', 'r') as f:
+            data = json.load(f)
+        
+        print(f'Platform: {data[\"platform\"]}')
+        print('Metrics:')
+        for metric, value in data['metrics'].items():
+            print(f'- {metric}: {value:.3f}µs')
+        " >> slo_summary.md
+                echo "" >> slo_summary.md
+              fi
+            done
+          fi
+        done
+    
+    - name: Upload SLO Summary
+      uses: actions/upload-artifact@v3
+      with:
+        name: slo-summary-${{ github.sha }}
+        path: slo_summary.md
+        retention-days: 90
+    
+    - name: Check overall SLO status
+      run: |
+        if [ "${{ needs.slo-testing.result }}" = "success" ]; then
+          echo "✅ All SLO gates passed"
+        else
+          echo "❌ Some SLO gates failed"
+          exit 1
+        fi

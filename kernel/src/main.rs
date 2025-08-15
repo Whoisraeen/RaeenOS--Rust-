@@ -29,10 +29,11 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
         let mut writer = VGA_WRITER.lock();
         writeln!(writer, "RaeenOS: booting kernel...").ok();
         writeln!(writer, "Welcome to RaeenOS kernel v0.1").ok();
+        writeln!(writer, "Launching desktop environment...").ok();
     }
-    // heap smoke test
-    // keep boot minimal while resolving mapping
-    loop { cpu_halt(); }
+    
+    // Launch the desktop environment instead of halting
+    k::launch_desktop_environment();
 }
 
 const BUFFER_HEIGHT: usize = 25;

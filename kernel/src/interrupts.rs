@@ -39,6 +39,14 @@ pub fn init() {
     x86_64::instructions::interrupts::enable();
 }
 
+/// Initialize interrupts with APIC support
+pub fn init_with_apic() {
+    IDT.load();
+    // Don't initialize legacy PICs when using APIC
+    // APIC initialization handles interrupt routing
+    x86_64::instructions::interrupts::enable();
+}
+
 extern "x86-interrupt" fn breakpoint_handler(stack_frame: InterruptStackFrame) {
     crate::serial_println!("INT3 breakpoint: {:?}", stack_frame);
 }
@@ -67,13 +75,27 @@ extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFr
     // Tick time and schedule
     crate::time::tick();
     crate::process::schedule_tick();
-    unsafe { PICS.lock().notify_end_of_interrupt(InterruptIndex::Timer.as_u8()); }
+    
+    if crate::apic::is_apic_enabled() {
+        crate::apic::send_eoi();
+    } else {
+        unsafe {
+            PICS.lock().notify_end_of_interrupt(InterruptIndex::Timer.as_u8());
+        }
+    }
 }
 
 extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStackFrame) {
     let mut port = Port::new(0x60);
     let _scancode: u8 = unsafe { port.read() };
-    unsafe { PICS.lock().notify_end_of_interrupt(InterruptIndex::Keyboard.as_u8()); }
+    
+    if crate::apic::is_apic_enabled() {
+        crate::apic::send_eoi();
+    } else {
+        unsafe {
+            PICS.lock().notify_end_of_interrupt(InterruptIndex::Keyboard.as_u8());
+        }
+    }
 }
 
 

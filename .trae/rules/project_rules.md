@@ -7,6 +7,7 @@ These rules are non-negotiable. They exist to protect system integrity, performa
 - Do not comment out/disable modules to “get a build working”. Fix root causes.
 - No duplicate implementations. Search the codebase before adding anything new.
 - No trivial toy kernels or resets of architecture decisions. Respect `Docs/RaeenOS.md` and `Docs/Choice.md`.
+- No duplicate files with advanced, enhanced, or anything else in the name. If the file already exsists under a different name edit that file. 
 
 ### 2) Editing discipline
 - Keep edits small, focused, and reversible. Do not reformat unrelated code.

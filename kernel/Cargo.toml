@@ -3,6 +3,9 @@ name = "kernel"
 version = "0.1.0"
 edition = "2021"
 
+[lints.rust]
+warnings = "deny"
+
 [dependencies]
 bootloader = { version = "0.9.23", features = ["map_physical_memory"] }
 spin = "0.9.8"

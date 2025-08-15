@@ -4,6 +4,8 @@ use alloc::vec;
 use alloc::format;
 // use core::arch::asm;
 use x86_64::VirtAddr;
+use x86_64::structures::gdt::{SegmentSelector};
+use x86_64::PrivilegeLevel;
 // use crate::process::{Priority, ProcessPermissions, SandboxLevel};
 use crate::filesystem;
 
@@ -58,6 +60,21 @@ pub enum SyscallNumber {
     DrawText = 107,
     GetInput = 108,
     PlaySound = 109,
+    
+    // Enhanced graphics syscalls
+    SetVsync = 120,
+    GetFrameStats = 121,
+    ClearFramebuffer = 122,
+    BlitBuffer = 123,
+    SetInputFocus = 124,
+    GetWindowList = 125,
+    ResizeWindow = 126,
+    MoveWindow = 127,
+    
+    // Signal handling
+    Signal = 110,
+    SigAction = 111,
+    SigReturn = 112,
     
     // Security
     RequestPermission = 200,
@@ -160,6 +177,9 @@ pub fn handle_syscall(
         107 => SyscallNumber::DrawText,
         108 => SyscallNumber::GetInput,
         109 => SyscallNumber::PlaySound,
+        110 => SyscallNumber::Signal,
+        111 => SyscallNumber::SigAction,
+        112 => SyscallNumber::SigReturn,
         200 => SyscallNumber::RequestPermission,
         201 => SyscallNumber::SetSandbox,
         202 => SyscallNumber::GetPermissions,
@@ -215,6 +235,20 @@ pub fn handle_syscall(
         SyscallNumber::GetInput => sys_get_input(arg1),
         SyscallNumber::PlaySound => sys_play_sound(arg1, arg2, arg3),
         
+        // Enhanced graphics syscalls
+        SyscallNumber::SetVsync => sys_set_vsync(arg1 != 0),
+        SyscallNumber::GetFrameStats => sys_get_frame_stats(arg1),
+        SyscallNumber::ClearFramebuffer => sys_clear_framebuffer(arg1),
+        SyscallNumber::BlitBuffer => sys_blit_buffer(arg1, arg2, arg3, arg4, arg5, arg6),
+        SyscallNumber::SetInputFocus => sys_set_input_focus(arg1),
+        SyscallNumber::GetWindowList => sys_get_window_list(arg1, arg2),
+        SyscallNumber::ResizeWindow => sys_resize_window(arg1, arg2, arg3),
+        SyscallNumber::MoveWindow => sys_move_window(arg1, arg2, arg3),
+        
+        SyscallNumber::Signal => sys_signal(arg1 as i32, arg2),
+        SyscallNumber::SigAction => sys_sigaction(arg1 as i32, arg2, arg3),
+        SyscallNumber::SigReturn => sys_sigreturn(),
+        
         SyscallNumber::RequestPermission => sys_request_permission(arg1),
         SyscallNumber::SetSandbox => sys_set_sandbox(arg1),
         SyscallNumber::GetPermissions => sys_get_permissions(arg1),
@@ -227,8 +261,8 @@ pub fn handle_syscall(
 
 // Process management syscalls
 fn sys_exit(exit_code: i32) -> SyscallResult {
-    crate::process::terminate_process(crate::process::get_current_process_info().unwrap().0);
-    SyscallResult::success(exit_code as i64)
+    // This function should never return as exit_process is noreturn
+    crate::process::exit_process(exit_code);
 }
 
 fn sys_fork() -> SyscallResult {
@@ -278,8 +312,23 @@ fn sys_wait(pid: u64) -> SyscallResult {
 }
 
 fn sys_kill(pid: u64, signal: i32) -> SyscallResult {
-    crate::process::terminate_process(pid);
-    SyscallResult::success(0)
+    use crate::process::{Signal, send_signal};
+    
+    // Convert signal number to Signal enum
+    let sig = match signal {
+        9 => Signal::SIGKILL,
+        15 => Signal::SIGTERM,
+        19 => Signal::SIGSTOP,
+        18 => Signal::SIGCONT,
+        10 => Signal::SIGUSR1,
+        12 => Signal::SIGUSR2,
+        _ => return SyscallResult::error(SyscallError::InvalidArgument),
+    };
+    
+    match send_signal(pid, sig) {
+        Ok(()) => SyscallResult::success(0),
+        Err(_) => SyscallResult::error(SyscallError::ResourceNotFound),
+    }
 }
 
 fn sys_getpid() -> SyscallResult {
@@ -655,6 +704,127 @@ fn sys_play_sound(sound_id: u64, volume: u64, flags: u64) -> SyscallResult {
     }
 }
 
+// Enhanced graphics syscalls
+fn sys_set_vsync(enabled: bool) -> SyscallResult {
+    match crate::graphics::set_vsync(enabled) {
+        Ok(()) => SyscallResult::success(0),
+        Err(_) => SyscallResult::error(SyscallError::IoError)
+    }
+}
+
+fn sys_get_frame_stats(buffer: u64) -> SyscallResult {
+    match crate::graphics::get_frame_stats() {
+        Ok((frame_count, last_present_time)) => {
+            let stats = [frame_count, last_present_time];
+            unsafe { copy_to_user(buffer, unsafe_any_as_bytes(&stats)) };
+            SyscallResult::success(0)
+        }
+        Err(_) => SyscallResult::error(SyscallError::IoError)
+    }
+}
+
+fn sys_clear_framebuffer(color: u64) -> SyscallResult {
+    let c = u32_color_from_u64(color);
+    let color = crate::graphics::Color { 
+        r: ((c >> 16) & 0xFF) as u8, 
+        g: ((c >> 8) & 0xFF) as u8, 
+        b: (c & 0xFF) as u8, 
+        a: ((c >> 24) & 0xFF) as u8 
+    };
+    match crate::graphics::clear_framebuffer(color) {
+        Ok(()) => SyscallResult::success(0),
+        Err(_) => SyscallResult::error(SyscallError::IoError)
+    }
+}
+
+fn sys_blit_buffer(src_buffer: u64, dst_x: u64, dst_y: u64, width: u64, height: u64, stride: u64) -> SyscallResult {
+    let buffer_size = (height * stride) as usize;
+    let src_data = unsafe { slice_from_user(src_buffer, buffer_size) };
+    
+    match crate::graphics::blit_buffer(&src_data, dst_x as u32, dst_y as u32, width as u32, height as u32, stride as u32) {
+        Ok(()) => SyscallResult::success(0),
+        Err(_) => SyscallResult::error(SyscallError::InvalidArgument)
+    }
+}
+
+fn sys_set_input_focus(window_id: u64) -> SyscallResult {
+    match crate::graphics::set_input_focus(window_id as crate::graphics::WindowId) {
+        Ok(()) => SyscallResult::success(0),
+        Err(_) => SyscallResult::error(SyscallError::ResourceNotFound)
+    }
+}
+
+fn sys_get_window_list(buffer: u64, max_count: u64) -> SyscallResult {
+    let window_ids = crate::graphics::get_window_list();
+    let count = core::cmp::min(window_ids.len(), max_count as usize);
+    let data = &window_ids[..count];
+    let bytes = unsafe { core::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * core::mem::size_of::<u32>()) };
+    unsafe { copy_to_user(buffer, bytes) };
+    SyscallResult::success(count as i64)
+}
+
+fn sys_resize_window(window_id: u64, width: u64, height: u64) -> SyscallResult {
+    match crate::graphics::resize_window(window_id as crate::graphics::WindowId, width as u32, height as u32) {
+        Ok(()) => SyscallResult::success(0),
+        Err(_) => SyscallResult::error(SyscallError::ResourceNotFound)
+    }
+}
+
+fn sys_move_window(window_id: u64, x: u64, y: u64) -> SyscallResult {
+    match crate::graphics::move_window(window_id as crate::graphics::WindowId, x as i32, y as i32) {
+        Ok(()) => SyscallResult::success(0),
+        Err(_) => SyscallResult::error(SyscallError::ResourceNotFound)
+    }
+}
+
+// Signal handling syscalls
+ fn sys_signal(signal: i32, handler: u64) -> SyscallResult {
+     use crate::process::{Signal, set_signal_handler, SignalHandler};
+     
+     // Convert signal number to Signal enum
+     let sig = match signal {
+         9 => Signal::SIGKILL,
+         15 => Signal::SIGTERM,
+         19 => Signal::SIGSTOP,
+         18 => Signal::SIGCONT,
+         10 => Signal::SIGUSR1,
+         12 => Signal::SIGUSR2,
+         _ => return SyscallResult::error(SyscallError::InvalidArgument),
+     };
+     
+     // For now, we only support default handlers (handler = 0) or ignore (handler = 1)
+     let handler_fn = if handler == 0 {
+         None // Use default handler
+     } else if handler == 1 {
+         // Ignore signal - create a no-op handler
+         fn ignore_signal(_signal: Signal) {}
+         Some(ignore_signal as SignalHandler)
+     } else {
+         // Custom user handlers not yet implemented
+         return SyscallResult::error(SyscallError::NotImplemented);
+     };
+     
+     match set_signal_handler(sig, handler_fn) {
+         Ok(()) => SyscallResult::success(0),
+         Err(_) => SyscallResult::error(SyscallError::InvalidArgument)
+     }
+ }
+ 
+ fn sys_sigaction(signal: i32, new_action: u64, old_action: u64) -> SyscallResult {
+     // Basic sigaction implementation - for now just redirect to sys_signal
+     if new_action != 0 {
+         // For simplicity, treat new_action as a handler address
+         sys_signal(signal, new_action)
+     } else {
+         SyscallResult::error(SyscallError::InvalidArgument)
+     }
+ }
+ 
+ fn sys_sigreturn() -> SyscallResult {
+     // Signal return not yet fully implemented
+     SyscallResult::success(0)
+ }
+
 // Security syscalls
 fn sys_request_permission(permission: u64) -> SyscallResult {
     // Implement permission requesting
@@ -781,7 +951,98 @@ pub extern "C" fn syscall_handler(
 }
 
 pub fn init() {
-    // For now, syscalls are exposed via the C ABI `syscall_handler` entry.
+    // Set up SYSCALL/SYSRET mechanism
+    setup_syscall_entry();
+}
+
+/// Set up the SYSCALL/SYSRET mechanism
+fn setup_syscall_entry() {
+    use x86_64::registers::model_specific::{LStar, SFMask, Star};
+    use x86_64::registers::rflags::RFlags;
+    
+    // Set up STAR register with kernel/user code segments
+    let kernel_cs = crate::gdt::get_kernel_code_selector().0 as u64;
+    let user_cs = crate::gdt::get_user_code_selector().0 as u64;
+    
+    // STAR[63:48] = User CS, STAR[47:32] = Kernel CS
+    let kernel_cs_selector = SegmentSelector::new(1, PrivilegeLevel::Ring0); // GDT index 1
+    let user_cs_selector = SegmentSelector::new(2, PrivilegeLevel::Ring3);   // GDT index 2
+    let user_ss_selector = SegmentSelector::new(3, PrivilegeLevel::Ring3);   // GDT index 3
+    Star::write(kernel_cs_selector, user_cs_selector, user_ss_selector, user_cs_selector).unwrap();
+    
+    // Set LSTAR to point to our syscall entry point
+    LStar::write(VirtAddr::new(syscall_entry as u64));
+    
+    // Set SFMASK to mask interrupts during syscall
+    SFMask::write(RFlags::INTERRUPT_FLAG);
+    
+    // Enable SYSCALL/SYSRET in EFER
+    use x86_64::registers::model_specific::Efer;
+    let mut efer = Efer::read();
+    efer |= x86_64::registers::model_specific::EferFlags::SYSTEM_CALL_EXTENSIONS;
+    unsafe { Efer::write(efer); }
+}
+
+/// Low-level syscall entry point
+extern "C" {
+    fn syscall_entry();
+}
+
+// Assembly implementation of syscall entry
+core::arch::global_asm!(
+    ".global syscall_entry",
+    "syscall_entry:",
+    // Save user stack pointer
+    "mov gs:[0x10], rsp",  // Save user RSP to per-CPU area
+    
+    // Switch to kernel stack
+    "mov rsp, gs:[0x08]",  // Load kernel RSP from per-CPU area
+    
+    // Save user registers
+    "push rcx",            // User RIP (saved by SYSCALL)
+    "push r11",            // User RFLAGS (saved by SYSCALL)
+    "push rax",            // Syscall number
+    "push rdi",            // Arg 1
+    "push rsi",            // Arg 2
+    "push rdx",            // Arg 3
+    "push r10",            // Arg 4 (r10 instead of rcx for syscalls)
+    "push r8",             // Arg 5
+    "push r9",             // Arg 6
+    
+    // Call high-level syscall handler
+    "call syscall_handler_wrapper",
+    
+    // Restore user registers
+    "pop r9",
+    "pop r8",
+    "pop r10",
+    "pop rdx",
+    "pop rsi",
+    "pop rdi",
+    "add rsp, 8",          // Skip syscall number
+    "pop r11",             // Restore user RFLAGS
+    "pop rcx",             // Restore user RIP
+    
+    // Restore user stack pointer
+    "mov rsp, gs:[0x10]",
+    
+    // Return to userspace
+    "sysretq"
+);
+
+/// High-level syscall handler wrapper
+#[no_mangle]
+extern "C" fn syscall_handler_wrapper(
+    syscall_num: u64,
+    arg1: u64,
+    arg2: u64,
+    arg3: u64,
+    arg4: u64,
+    arg5: u64,
+    arg6: u64,
+) -> u64 {
+    // Call the existing syscall handler
+    syscall_handler(syscall_num, arg1, arg2, arg3, arg4, arg5, arg6)
 }
 
 // ------- helper functions for user pointers (temporary, unsafe) -------

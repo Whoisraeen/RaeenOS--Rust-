@@ -13,6 +13,9 @@ use criterion::{Criterion, BenchmarkId};
 use proptest::prelude::*;
 use mockall::predicate::*;
 
+mod slo;
+use slo::{SloTestRunner, SloGate};
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct TestConfig {
     workspace_root: PathBuf,
@@ -40,7 +43,7 @@ fn main() {
         .about("Testing framework for RaeenOS - Build and ISO testing")
         .arg(Arg::new("command")
             .help("Test command to execute")
-            .value_parser(["build", "iso", "qemu", "all", "clean"])
+            .value_parser(["build", "iso", "qemu", "all", "clean", "slo"])
             .required(true)
             .index(1))
         .arg(Arg::new("profile")
@@ -71,6 +74,17 @@ fn main() {
             .help("Run QEMU in headless mode")
             .long("headless")
             .action(clap::ArgAction::SetTrue))
+        .arg(Arg::new("sku")
+            .help("Reference SKU for SLO testing")
+            .long("sku")
+            .value_name("SKU_ID")
+            .default_value("desk-sku-a"))
+        .arg(Arg::new("output")
+            .help("Output file for SLO results")
+            .short('o')
+            .long("output")
+            .value_name("FILE")
+            .default_value("slo_results.json"))
         .get_matches();
     
     let result = match run_tests(&matches) {
@@ -110,6 +124,8 @@ fn run_tests(matches: &ArgMatches) -> Result<Vec<TestResult>, Box<dyn std::error
     let profile = matches.get_one::<String>("profile").unwrap();
     let verbose = matches.get_flag("verbose");
     let headless = matches.get_flag("headless");
+    let sku_id = matches.get_one::<String>("sku").unwrap();
+    let output_file = matches.get_one::<String>("output").unwrap();
     
     let mut results = Vec::new();
     
@@ -133,6 +149,9 @@ fn run_tests(matches: &ArgMatches) -> Result<Vec<TestResult>, Box<dyn std::error
         }
         "clean" => {
             results.push(test_clean(&config, verbose)?);
+        }
+        "slo" => {
+            results.push(test_slo(&config, sku_id, output_file, verbose)?);
         }
         _ => return Err(format!("Unknown command: {}", command).into()),
     }
@@ -387,6 +406,68 @@ fn test_clean(config: &TestConfig, verbose: bool) -> Result<TestResult, Box<dyn 
         info!("Clean test passed in {:?}", duration);
     } else {
         error!("Clean test failed: {}", stderr);
+    }
+    
+    Ok(result)
+}
+
+fn test_slo(config: &TestConfig, sku_id: &str, output_file: &str, verbose: bool) -> Result<TestResult, Box<dyn std::error::Error>> {
+    info!("Running SLO test suite for SKU: {}", sku_id);
+    
+    let start_time = Instant::now();
+    
+    // Load SLO configuration
+    let slo_config = match SloTestRunner::load_config(sku_id) {
+        Ok(config) => config,
+        Err(e) => {
+            return Ok(TestResult {
+                test_name: "slo".to_string(),
+                success: false,
+                duration: start_time.elapsed(),
+                output: format!("Failed to load SLO config: {}", e),
+                errors: vec![e.to_string()],
+            });
+        }
+    };
+    
+    // Create SLO test runner
+    let mut runner = SloTestRunner::new(slo_config);
+    
+    // Run all SLO tests
+    let test_result = runner.run_all_tests();
+    
+    let duration = start_time.elapsed();
+    
+    // Check SLO compliance
+    let (compliance, failures) = runner.check_slo_compliance();
+    
+    // Export results to JSON
+    let output_path = config.workspace_root.join(output_file);
+    if let Err(e) = runner.export_results(&output_path) {
+        warn!("Failed to export SLO results: {}", e);
+    }
+    
+    // Generate report
+    let report = runner.generate_report();
+    
+    if verbose {
+        println!("\n{}", report);
+    }
+    
+    let success = test_result.is_ok() && compliance;
+    
+    let result = TestResult {
+        test_name: "slo".to_string(),
+        success,
+        duration,
+        output: report,
+        errors: if success { Vec::new() } else { failures },
+    };
+    
+    if success {
+        info!("SLO test suite passed in {:?}", duration);
+    } else {
+        error!("SLO test suite failed: {} violations", failures.len());
     }
     
     Ok(result)

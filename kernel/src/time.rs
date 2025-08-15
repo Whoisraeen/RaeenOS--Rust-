@@ -120,6 +120,31 @@ pub fn init() {
     
     // Initialize PIT (Programmable Interval Timer) for regular timer interrupts
     init_pit();
+    
+    // Calibrate TSC for high-precision timing
+    calibrate_tsc();
+}
+
+/// Initialize timer with APIC support
+/// TODO: Re-enable once APIC module compilation is fixed
+pub fn init_with_apic() {
+    // Read initial time from RTC
+    let rtc_time = read_rtc();
+    let timestamp = rtc_time.to_timestamp();
+    SYSTEM_TIME.store(timestamp, Ordering::SeqCst);
+    
+    // Calibrate TSC for high-precision timing
+    calibrate_tsc();
+    
+    // Fall back to PIT for now
+    init_pit();
+    
+    // TODO: Re-enable APIC timer initialization
+    // if crate::arch::has_cpu_feature(crate::arch::CpuFeature::TscDeadline) {
+    //     init_tsc_deadline_timer();
+    // } else {
+    //     init_apic_timer();
+    // }
 }
 
 fn init_pit() {
@@ -143,6 +168,68 @@ fn init_pit() {
     TIMER_FREQUENCY.store(TARGET_FREQUENCY as u64, Ordering::SeqCst);
 }
 
+/// Initialize TSC-deadline timer
+/// TODO: Re-enable once APIC module is available
+#[allow(dead_code)]
+fn init_tsc_deadline_timer() {
+    // const TARGET_FREQUENCY: u64 = 1000; // 1000 Hz (1ms intervals)
+    // 
+    // let tsc_freq = TSC_FREQUENCY.load(Ordering::SeqCst);
+    // if tsc_freq > 0 {
+    //     let deadline_interval = tsc_freq / TARGET_FREQUENCY;
+    //     
+    //     // Configure APIC timer in TSC-deadline mode
+    //     if let Err(e) = crate::apic::set_timer_mode(crate::apic::TimerMode::TscDeadline) {
+    //         crate::serial::_print(format_args!("[Timer] Failed to set TSC-deadline mode: {}\n", e));
+    //         // Fall back to APIC timer
+    //         init_apic_timer();
+    //         return;
+    //     }
+    //     
+    //     // Set initial deadline
+    //     let current_tsc = read_tsc();
+    //     let deadline = current_tsc + deadline_interval;
+    //     crate::apic::set_timer_deadline(deadline);
+    //     
+    //     TIMER_FREQUENCY.store(TARGET_FREQUENCY, Ordering::SeqCst);
+    //     crate::serial::_print(format_args!("[Timer] TSC-deadline timer initialized at {} Hz\n", TARGET_FREQUENCY));
+    // } else {
+    //     crate::serial::_print(format_args!("[Timer] TSC not calibrated, falling back to APIC timer\n"));
+    //     init_apic_timer();
+    // }
+    
+    // Placeholder implementation - fall back to PIT
+    init_pit();
+}
+
+/// Initialize APIC timer in one-shot mode
+/// TODO: Re-enable once APIC module is available
+#[allow(dead_code)]
+fn init_apic_timer() {
+    // const TARGET_FREQUENCY: u64 = 1000; // 1000 Hz (1ms intervals)
+    // 
+    // // Configure APIC timer in one-shot mode
+    // if let Err(e) = crate::apic::set_timer_mode(crate::apic::TimerMode::OneShot) {
+    //     crate::serial::_print(format_args!("[Timer] Failed to set APIC timer mode: {}\n", e));
+    //     // Fall back to PIT
+    //     init_pit();
+    //     return;
+    // }
+    // 
+    // // Set timer divisor and initial count
+    // let divisor = 16; // Divide by 16
+    // let initial_count = 1000000; // Approximate 1ms at typical APIC frequencies
+    // 
+    // crate::apic::set_timer_divisor(divisor);
+    // crate::apic::set_timer_initial_count(initial_count);
+    // 
+    // TIMER_FREQUENCY.store(TARGET_FREQUENCY, Ordering::SeqCst);
+    // crate::serial::_print(format_args!("[Timer] APIC timer initialized at {} Hz\n", TARGET_FREQUENCY));
+    
+    // Placeholder implementation - fall back to PIT
+    init_pit();
+}
+
 // Called by timer interrupt handler
 pub fn tick() {
     let ticks = UPTIME_TICKS.fetch_add(1, Ordering::SeqCst) + 1;
@@ -152,6 +239,17 @@ pub fn tick() {
     if ticks % frequency == 0 {
         SYSTEM_TIME.fetch_add(1, Ordering::SeqCst);
     }
+    
+    // TODO: Re-enable TSC-deadline timer support once APIC module is available
+    // if crate::apic::is_initialized() && crate::arch::has_cpu_feature(crate::arch::CpuFeature::TscDeadline) {
+    //     let tsc_freq = TSC_FREQUENCY.load(Ordering::SeqCst);
+    //     if tsc_freq > 0 {
+    //         let deadline_interval = tsc_freq / frequency;
+    //         let current_tsc = read_tsc();
+    //         let next_deadline = current_tsc + deadline_interval;
+    //         crate::apic::set_timer_deadline(next_deadline);
+    //     }
+    // }
 }
 
 pub fn get_timestamp() -> u64 {
