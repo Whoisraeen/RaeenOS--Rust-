@@ -1,1 +1,0 @@
-C:\Users\woisr\Documents\RaeenOS\target\x86_64-unknown-none\debug\libkernel.rlib: C:\Users\woisr\Documents\RaeenOS\kernel\src\gdt.rs C:\Users\woisr\Documents\RaeenOS\kernel\src\heap.rs C:\Users\woisr\Documents\RaeenOS\kernel\src\lib.rs C:\Users\woisr\Documents\RaeenOS\kernel\src\memory.rs C:\Users\woisr\Documents\RaeenOS\kernel\src\serial.rs

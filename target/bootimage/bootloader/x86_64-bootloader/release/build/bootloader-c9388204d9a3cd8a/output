@@ -1,7 +1,0 @@
-cargo:rerun-if-changed=C:\Users\woisr\Documents\RaeenOS\kernel\Cargo.toml
-cargo:rustc-link-search=native=C:\Users\woisr\Documents\RaeenOS\target\bootimage\bootloader\x86_64-bootloader\release\build\bootloader-c9388204d9a3cd8a\out
-cargo:rustc-link-lib=static=kernel_bin-kernel
-cargo:rerun-if-env-changed=KERNEL
-cargo:rerun-if-env-changed=KERNEL_MANIFEST
-cargo:rerun-if-changed=C:\Users\woisr\Documents\RaeenOS\target\x86_64-unknown-none\release\kernel
-cargo:rerun-if-changed=build.rs
