@@ -878,7 +878,7 @@ pub fn get_boot_info() -> Option<UefiBootInfo> {
 /// Get framebuffer information
 pub fn get_framebuffer_info() -> Option<FramebufferInfo> {
     let manager = UEFI_MANAGER.lock();
-    manager.get_boot_info()?.framebuffer
+    manager.get_boot_info()?.framebuffer.clone()
 }
 
 /// Get memory map

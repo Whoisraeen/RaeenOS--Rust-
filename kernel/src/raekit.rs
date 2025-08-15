@@ -66,34 +66,34 @@ pub enum AppState {
 // Application runtime context
 #[derive(Debug, Clone)]
 struct AppContext {
-    app_id: u32,
+    _app_id: u32,
     process_id: u32,
     state: AppState,
     capabilities: Vec<FrameworkCapability>,
     resource_limits: ResourceLimits,
-    start_time: u64,
+    _start_time: u64,
     memory_usage: u64,
     cpu_usage: f32,
 }
 
 // Resource limits for applications
 #[derive(Debug, Clone)]
-struct ResourceLimits {
-    max_memory: u64,
-    max_cpu_percent: f32,
-    max_file_handles: u32,
-    max_network_connections: u32,
-    max_threads: u32,
+pub struct ResourceLimits {
+    _max_memory: u64,
+    _max_cpu_percent: f32,
+    _max_file_handles: u32,
+    _max_network_connections: u32,
+    _max_threads: u32,
 }
 
 impl Default for ResourceLimits {
     fn default() -> Self {
         Self {
-            max_memory: 64 * 1024 * 1024, // 64MB
-            max_cpu_percent: 50.0,
-            max_file_handles: 100,
-            max_network_connections: 50,
-            max_threads: 10,
+            _max_memory: 64 * 1024 * 1024, // 64MB
+            _max_cpu_percent: 50.0,
+            _max_file_handles: 100,
+            _max_network_connections: 50,
+            _max_threads: 10,
         }
     }
 }
@@ -295,12 +295,12 @@ pub fn launch_application(app_name: &str, args: &[&str]) -> Result<u32, ()> {
     raekit.next_app_id += 1;
 
     let context = AppContext {
-        app_id,
+        _app_id: app_id,
         process_id: current_pid as u32,
         state: AppState::Starting,
         capabilities: Vec::new(),
         resource_limits: ResourceLimits::default(),
-        start_time: crate::time::get_system_uptime(),
+        _start_time: crate::time::get_system_uptime(),
         memory_usage: 0,
         cpu_usage: 0.0,
     };

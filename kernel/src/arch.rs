@@ -151,6 +151,10 @@ pub enum CpuFeature {
     Sha,
     Avx512bw,
     Avx512vl,
+    // User-Mode Instruction Prevention
+    Umip,
+    // Invariant TSC (from extended features)
+    InvariantTsc,
 }
 
 /// CPU feature flags
@@ -251,6 +255,10 @@ pub struct CpuFeatures {
     pub sha: bool,
     pub avx512bw: bool,
     pub avx512vl: bool,
+    // User-Mode Instruction Prevention
+    pub umip: bool,
+    // Invariant TSC support
+    pub invariant_tsc: bool,
 }
 
 /// CPU information structure
@@ -341,10 +349,16 @@ fn get_brand_string() -> [u8; 48] {
 
 /// Parse CPU features from CPUID leaf 1
 fn parse_cpu_features() -> CpuFeatures {
-    let (eax, ebx, ecx, edx) = cpuid(1, 0);
+    let (_eax, _ebx, ecx, edx) = cpuid(1, 0);
     
     // Get extended features from leaf 7
     let (_, ext_ebx, ext_ecx, _) = cpuid(7, 0);
+    
+    // Check for invariant TSC (CPUID leaf 0x80000007, EDX bit 8)
+    let invariant_tsc = {
+        let (_, _, _, ext_edx) = cpuid(0x80000007, 0);
+        (ext_edx & (1 << 8)) != 0
+    };
     
     CpuFeatures {
         // EDX features (leaf 1)
@@ -445,6 +459,12 @@ fn parse_cpu_features() -> CpuFeatures {
         sha: (ext_ebx & (1 << 29)) != 0,
         avx512bw: (ext_ebx & (1 << 30)) != 0,
         avx512vl: (ext_ebx & (1 << 31)) != 0,
+        
+        // User-Mode Instruction Prevention (leaf 7, ECX bit 2)
+        umip: (ext_ecx & (1 << 2)) != 0,
+        
+        // Invariant TSC
+        invariant_tsc,
     }
 }
 
@@ -648,6 +668,8 @@ pub fn has_cpu_feature(feature: CpuFeature) -> bool {
         CpuFeature::Sha => info.features.sha,
         CpuFeature::Avx512bw => info.features.avx512bw,
         CpuFeature::Avx512vl => info.features.avx512vl,
+        CpuFeature::Umip => info.features.umip,
+        CpuFeature::InvariantTsc => info.features.invariant_tsc,
     }
 }
 
@@ -684,6 +706,250 @@ pub fn get_cpu_vendor_string() -> &'static str {
         CpuVendor::Intel => "Intel",
         CpuVendor::Amd => "AMD",
         CpuVendor::Unknown => "Unknown",
+    }
+}
+
+/// TSC (Time Stamp Counter) operations for high-precision timing
+pub mod tsc {
+    use core::sync::atomic::{AtomicU64, AtomicBool, Ordering};
+    use x86_64::registers::model_specific::Msr;
+    
+    /// TSC frequency in Hz (calibrated)
+    static TSC_FREQUENCY: AtomicU64 = AtomicU64::new(0);
+    
+    /// Whether invariant TSC is available and validated
+    static INVARIANT_TSC_AVAILABLE: AtomicBool = AtomicBool::new(false);
+    
+    /// Cross-CPU TSC synchronization data
+    static TSC_SYNC_MASTER: AtomicU64 = AtomicU64::new(0);
+    static TSC_SYNC_SLAVE: AtomicU64 = AtomicU64::new(0);
+    static TSC_SYNC_BARRIER: AtomicU64 = AtomicU64::new(0);
+    
+    /// Read the Time Stamp Counter
+    #[inline]
+    pub fn read_tsc() -> u64 {
+        unsafe {
+            let mut low: u32;
+            let mut high: u32;
+            core::arch::asm!(
+                "rdtsc",
+                out("eax") low,
+                out("edx") high,
+                options(nomem, nostack)
+            );
+            ((high as u64) << 32) | (low as u64)
+        }
+    }
+    
+    /// Read TSC with serialization (RDTSCP if available, otherwise LFENCE+RDTSC)
+    #[inline]
+    pub fn read_tsc_serialized() -> u64 {
+        unsafe {
+            let mut low: u32;
+            let mut high: u32;
+            let mut _aux: u32;
+            
+            // Try RDTSCP first (more precise)
+            if super::has_cpu_feature(super::CpuFeature::Rdrand) { // Using rdrand as proxy for modern CPU
+                core::arch::asm!(
+                    "rdtscp",
+                    out("eax") low,
+                    out("edx") high,
+                    out("ecx") _aux,
+                    options(nomem, nostack)
+                );
+            } else {
+                // Fallback to LFENCE + RDTSC
+                core::arch::asm!(
+                    "lfence",
+                    "rdtsc",
+                    out("eax") low,
+                    out("edx") high,
+                    options(nomem, nostack)
+                );
+            }
+            ((high as u64) << 32) | (low as u64)
+        }
+    }
+    
+    /// Initialize TSC subsystem
+    pub fn init() -> Result<(), &'static str> {
+        // Check if invariant TSC is available
+        if !super::has_cpu_feature(super::CpuFeature::InvariantTsc) {
+            return Err("Invariant TSC not supported");
+        }
+        
+        // Calibrate TSC frequency
+        calibrate_tsc_frequency()?;
+        
+        INVARIANT_TSC_AVAILABLE.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+    
+    /// Calibrate TSC frequency using APIC timer or PIT
+    fn calibrate_tsc_frequency() -> Result<(), &'static str> {
+        // Use a known timer source to calibrate TSC
+        // For now, we'll use a simple PIT-based calibration
+        let start_tsc = read_tsc_serialized();
+        
+        // Wait approximately 10ms using PIT
+        pit_delay_ms(10);
+        
+        let end_tsc = read_tsc_serialized();
+        let tsc_diff = end_tsc - start_tsc;
+        
+        // Calculate frequency (10ms = 1/100 second)
+        let tsc_freq = tsc_diff * 100;
+        TSC_FREQUENCY.store(tsc_freq, Ordering::SeqCst);
+        
+        Ok(())
+    }
+    
+    /// Simple PIT delay for calibration
+    fn pit_delay_ms(ms: u32) {
+        use x86_64::instructions::port::Port;
+        
+        let mut pit_cmd: Port<u8> = Port::new(0x43);
+        let mut pit_data: Port<u8> = Port::new(0x40);
+        
+        // Configure PIT channel 0 for one-shot mode
+        unsafe {
+            pit_cmd.write(0x30); // Channel 0, lobyte/hibyte, mode 0
+            
+            // Calculate count for desired delay
+            let count = (1193182 * ms) / 1000; // PIT frequency is ~1.193182 MHz
+            pit_data.write((count & 0xFF) as u8);
+            pit_data.write(((count >> 8) & 0xFF) as u8);
+        }
+        
+        // Busy wait for completion
+        for _ in 0..(ms * 1000) {
+            core::hint::spin_loop();
+        }
+    }
+    
+    /// Get TSC frequency in Hz
+    pub fn get_frequency() -> u64 {
+        TSC_FREQUENCY.load(Ordering::SeqCst)
+    }
+    
+    /// Check if invariant TSC is available
+    pub fn is_invariant_available() -> bool {
+        INVARIANT_TSC_AVAILABLE.load(Ordering::SeqCst)
+    }
+    
+    /// Convert TSC ticks to nanoseconds
+    pub fn ticks_to_ns(ticks: u64) -> u64 {
+        let freq = get_frequency();
+        if freq > 0 {
+            (ticks * 1_000_000_000) / freq
+        } else {
+            0
+        }
+    }
+    
+    /// Convert nanoseconds to TSC ticks
+    pub fn ns_to_ticks(ns: u64) -> u64 {
+        let freq = get_frequency();
+        if freq > 0 {
+            (ns * freq) / 1_000_000_000
+        } else {
+            0
+        }
+    }
+    
+    /// Synchronize TSC across CPUs (called on master CPU)
+    pub fn sync_master() -> Result<(), &'static str> {
+        if !is_invariant_available() {
+            return Err("Invariant TSC not available");
+        }
+        
+        // Reset synchronization barrier
+        TSC_SYNC_BARRIER.store(0, Ordering::SeqCst);
+        
+        // Read master TSC
+        let master_tsc = read_tsc_serialized();
+        TSC_SYNC_MASTER.store(master_tsc, Ordering::SeqCst);
+        
+        // Signal slaves to read their TSC
+        TSC_SYNC_BARRIER.store(1, Ordering::SeqCst);
+        
+        Ok(())
+    }
+    
+    /// Synchronize TSC across CPUs (called on slave CPUs)
+    pub fn sync_slave() -> Result<i64, &'static str> {
+        if !is_invariant_available() {
+            return Err("Invariant TSC not available");
+        }
+        
+        // Wait for master to signal
+        while TSC_SYNC_BARRIER.load(Ordering::SeqCst) == 0 {
+            core::hint::spin_loop();
+        }
+        
+        // Read slave TSC as close to master as possible
+        let slave_tsc = read_tsc_serialized();
+        TSC_SYNC_SLAVE.store(slave_tsc, Ordering::SeqCst);
+        
+        // Calculate skew
+        let master_tsc = TSC_SYNC_MASTER.load(Ordering::SeqCst);
+        let skew = slave_tsc as i64 - master_tsc as i64;
+        
+        Ok(skew)
+    }
+    
+    /// TSC-deadline timer operations
+    pub mod deadline {
+        use super::*;
+        
+        /// IA32_TSC_DEADLINE MSR
+        const IA32_TSC_DEADLINE: u32 = 0x6E0;
+        
+        /// Set TSC deadline timer
+        pub fn set_deadline(deadline_tsc: u64) {
+            if super::is_invariant_available() && 
+               super::super::has_cpu_feature(super::super::CpuFeature::TscDeadline) {
+                unsafe {
+                    Msr::new(IA32_TSC_DEADLINE).write(deadline_tsc);
+                }
+            }
+        }
+        
+        /// Set deadline timer for a specific duration in nanoseconds
+        pub fn set_deadline_ns(ns: u64) {
+            let current_tsc = super::read_tsc();
+            let deadline_ticks = super::ns_to_ticks(ns);
+            let deadline_tsc = current_tsc + deadline_ticks;
+            set_deadline(deadline_tsc);
+        }
+        
+        /// Set deadline timer for a specific duration in microseconds
+        pub fn set_deadline_us(us: u64) {
+            set_deadline_ns(us * 1000);
+        }
+        
+        /// Clear deadline timer
+        pub fn clear_deadline() {
+            if super::is_invariant_available() && 
+               super::super::has_cpu_feature(super::super::CpuFeature::TscDeadline) {
+                unsafe {
+                    Msr::new(IA32_TSC_DEADLINE).write(0);
+                }
+            }
+        }
+        
+        /// Get current deadline value
+        pub fn get_deadline() -> u64 {
+            if super::is_invariant_available() && 
+               super::super::has_cpu_feature(super::super::CpuFeature::TscDeadline) {
+                unsafe {
+                    Msr::new(IA32_TSC_DEADLINE).read()
+                }
+            } else {
+                0
+            }
+        }
     }
 }
 

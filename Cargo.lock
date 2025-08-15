@@ -632,6 +632,8 @@ dependencies = [
  "linked_list_allocator",
  "pc-keyboard",
  "pic8259",
+ "serde",
+ "serde_json",
  "spin",
  "uart_16550",
  "volatile 0.5.4",

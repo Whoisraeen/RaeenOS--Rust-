@@ -13,8 +13,8 @@ struct TextBuffer {
     lines: Vec<String>,
     cursor_line: usize,
     cursor_column: usize,
-    selection_start: Option<(usize, usize)>,
-    selection_end: Option<(usize, usize)>,
+    _selection_start: Option<(usize, usize)>,
+    _selection_end: Option<(usize, usize)>,
     modified: bool,
     file_path: Option<String>,
 }
@@ -25,8 +25,8 @@ impl TextBuffer {
             lines: vec![String::new()],
             cursor_line: 0,
             cursor_column: 0,
-            selection_start: None,
-            selection_end: None,
+            _selection_start: None,
+            _selection_end: None,
             modified: false,
             file_path: None,
         }
@@ -44,8 +44,8 @@ impl TextBuffer {
             lines,
             cursor_line: 0,
             cursor_column: 0,
-            selection_start: None,
-            selection_end: None,
+            _selection_start: None,
+            _selection_end: None,
             modified: false,
             file_path: None,
         }
@@ -223,13 +223,13 @@ impl Default for EditorConfig {
 // Editor session
 #[derive(Debug)]
 struct EditorSession {
-    session_id: u32,
+    _session_id: u32,
     buffer: TextBuffer,
     mode: EditorMode,
     syntax_type: SyntaxType,
     config: EditorConfig,
-    viewport_top: usize,
-    viewport_height: usize,
+    _viewport_top: usize,
+    _viewport_height: usize,
     search_query: Option<String>,
     undo_stack: Vec<TextBuffer>,
     redo_stack: Vec<TextBuffer>,
@@ -238,13 +238,13 @@ struct EditorSession {
 impl EditorSession {
     fn new(session_id: u32) -> Self {
         Self {
-            session_id,
+            _session_id: session_id,
             buffer: TextBuffer::new(),
             mode: EditorMode::Normal,
             syntax_type: SyntaxType::None,
             config: EditorConfig::default(),
-            viewport_top: 0,
-            viewport_height: 25,
+            _viewport_top: 0,
+            _viewport_height: 25,
             search_query: None,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
@@ -824,7 +824,7 @@ pub fn get_file_path(session_id: u32) -> Result<Option<String>, ()> {
 
 // Clean up RaeDE resources for a process
 pub fn cleanup_process_raede(process_id: u32) {
-    let mut raede = RAEDE_SYSTEM.lock();
+    let _raede = RAEDE_SYSTEM.lock();
     
     // In a real implementation, we would track which process owns which sessions
     // For now, we'll just clean up if there are no active processes

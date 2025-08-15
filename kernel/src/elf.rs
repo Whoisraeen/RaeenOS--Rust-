@@ -4,8 +4,9 @@
 //! into process address spaces.
 
 use alloc::vec::Vec;
-use alloc::format;
+
 use x86_64::VirtAddr;
+use x86_64::structures::paging::Mapper;
 use crate::vmm::{VmArea, VmAreaType, VmPermissions, VmError};
 
 /// ELF file header
@@ -149,15 +150,15 @@ impl ElfLoader {
                 // Convert ELF flags to VM permissions
                 let mut permissions = VmPermissions::empty();
                 if (ph.p_flags & PF_R) != 0 {
-                    permissions = permissions | VmPermissions::Read;
+                    permissions = permissions | VmPermissions::READ;
                 }
                 if (ph.p_flags & PF_W) != 0 {
-                    permissions = permissions | VmPermissions::Write;
+                    permissions = permissions | VmPermissions::WRITE;
                 }
                 if (ph.p_flags & PF_X) != 0 {
-                    permissions = permissions | VmPermissions::Execute;
+                    permissions = permissions | VmPermissions::EXECUTE;
                 }
-                permissions = permissions | VmPermissions::User;
+                permissions = permissions | VmPermissions::USER;
                 
                 // Determine area type
                 let area_type = if (ph.p_flags & PF_X) != 0 {
@@ -204,26 +205,106 @@ impl ElfLoader {
     
     /// Copy segment data to virtual memory
     fn copy_segment_data(&self, virt_addr: VirtAddr, data: &[u8], total_size: usize) -> Result<(), ElfError> {
-        // For now, we'll use a simplified approach
-        // In a real implementation, we would map pages and copy data properly
+        use x86_64::structures::paging::{Page, Size4KiB, PageTableFlags};
+        use crate::memory;
         
-        // This is a placeholder - actual implementation would:
-        // 1. Map physical pages to the virtual address range
-        // 2. Copy data from the ELF file to the mapped pages
-        // 3. Handle page boundaries correctly
-        
-        // For demonstration, we'll just validate the operation
         if data.len() > total_size {
             return Err(ElfError::InvalidProgramHeader);
         }
         
-        Ok(())
+        // Calculate page range
+        let start_page = Page::<Size4KiB>::containing_address(virt_addr);
+        let end_addr = virt_addr + total_size - 1u64;
+        let end_page = Page::<Size4KiB>::containing_address(end_addr);
+        
+        // Map pages and copy data
+        memory::with_mapper(|mapper| {
+            let mut data_offset = 0;
+            
+            for page in Page::range_inclusive(start_page, end_page) {
+                // Allocate a physical frame for this page
+                let frame = memory::allocate_frame().ok_or(ElfError::MemoryError(VmError::OutOfMemory))?;
+                
+                // Map the page with appropriate flags
+                let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
+                
+                if let Some(frame_alloc) = memory::FRAME_ALLOC.lock().as_mut() {
+                    let mapping = unsafe { mapper.map_to(page, frame, flags, &mut *frame_alloc) }
+                        .map_err(|_| ElfError::MemoryError(VmError::MapError))?;
+                    mapping.flush();
+                }
+                
+                // Calculate how much data to copy to this page
+                let page_start_addr = page.start_address();
+                let copy_start = if page_start_addr < virt_addr {
+                    virt_addr.as_u64() - page_start_addr.as_u64()
+                } else {
+                    0
+                };
+                
+                let copy_end = core::cmp::min(4096, total_size - (page_start_addr.as_u64() - virt_addr.as_u64()) as usize + copy_start as usize);
+                let copy_size = copy_end - copy_start as usize;
+                
+                if data_offset < data.len() && copy_size > 0 {
+                    let copy_amount = core::cmp::min(copy_size, data.len() - data_offset);
+                    
+                    // Copy data to the mapped page
+                    unsafe {
+                        let dest_ptr = (page_start_addr + copy_start).as_mut_ptr::<u8>();
+                        let src_ptr = data.as_ptr().add(data_offset);
+                        core::ptr::copy_nonoverlapping(src_ptr, dest_ptr, copy_amount);
+                    }
+                    
+                    data_offset += copy_amount;
+                }
+            }
+            
+            Ok(())
+        })
     }
     
     /// Zero-fill memory region
     fn zero_memory(&self, virt_addr: VirtAddr, size: usize) -> Result<(), ElfError> {
-        // Placeholder for zero-filling memory
-        // Actual implementation would map pages and zero them
+        use x86_64::structures::paging::{Page, Size4KiB};
+        
+        if size == 0 {
+            return Ok(());
+        }
+        
+        // Calculate page range
+        let start_page = Page::<Size4KiB>::containing_address(virt_addr);
+        let end_addr = virt_addr + size - 1u64;
+        let end_page = Page::<Size4KiB>::containing_address(end_addr);
+        
+        // Zero-fill the memory range
+        for page in Page::range_inclusive(start_page, end_page) {
+            let page_start_addr = page.start_address();
+            
+            // Calculate the range within this page to zero
+            let zero_start = if page_start_addr < virt_addr {
+                virt_addr.as_u64() - page_start_addr.as_u64()
+            } else {
+                0
+            };
+            
+            let page_end = page_start_addr + 4096u64;
+            let zero_end = if virt_addr + size < page_end {
+                (virt_addr + size).as_u64() - page_start_addr.as_u64()
+            } else {
+                4096
+            };
+            
+            let zero_size = zero_end - zero_start;
+            
+            if zero_size > 0 {
+                // Zero the memory range
+                unsafe {
+                    let dest_ptr = (page_start_addr + zero_start).as_mut_ptr::<u8>();
+                    core::ptr::write_bytes(dest_ptr, 0, zero_size as usize);
+                }
+            }
+        }
+        
         Ok(())
     }
 }

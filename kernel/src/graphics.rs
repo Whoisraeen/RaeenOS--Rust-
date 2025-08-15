@@ -502,8 +502,8 @@ pub struct WindowManager {
     next_window_id: WindowId,
     focused_window: Option<WindowId>,
     window_order: Vec<WindowId>,
-    screen_width: u32,
-    screen_height: u32,
+    _screen_width: u32,
+    _screen_height: u32,
     theme: RaeTheme,
     widgets: BTreeMap<u32, Widget>,
     next_widget_id: u32,
@@ -516,8 +516,8 @@ impl WindowManager {
             next_window_id: 1,
             focused_window: None,
             window_order: Vec::new(),
-            screen_width,
-            screen_height,
+            _screen_width: screen_width,
+            _screen_height: screen_height,
             theme: RaeTheme::default(),
             widgets: BTreeMap::new(),
             next_widget_id: 1,
@@ -932,7 +932,7 @@ impl GpuAccelerator {
         // 5. Issue draw call to GPU
         
         // For now, simulate the render command
-        let vertices = [
+        let _vertices = [
             (rect.x as f32, rect.y as f32, 0.0, 0.0), // Top-left
             ((rect.x + rect.width as i32) as f32, rect.y as f32, 1.0, 0.0), // Top-right
             ((rect.x + rect.width as i32) as f32, (rect.y + rect.height as i32) as f32, 1.0, 1.0), // Bottom-right
@@ -954,7 +954,7 @@ pub struct FramebufferCompositor {
     width: u32,
     height: u32,
     pitch: u32,
-    bpp: u32,
+    _bpp: u32,
     back_buffer: GraphicsBuffer,
     front_buffer: GraphicsBuffer,
     dirty_regions: Vec<Rect>,
@@ -970,7 +970,7 @@ impl FramebufferCompositor {
             width,
             height,
             pitch,
-            bpp,
+            _bpp: bpp,
             back_buffer: GraphicsBuffer::new(width, height),
             front_buffer: GraphicsBuffer::new(width, height),
             dirty_regions: Vec::new(),
@@ -1012,7 +1012,7 @@ impl FramebufferCompositor {
     }
     
     /// Blit with clipping support
-    fn blit_with_clipping(&mut self, src: &GraphicsBuffer, src_rect: Rect, dst_rect: Rect) {
+    fn blit_with_clipping(&mut self, src: &GraphicsBuffer, _src_rect: Rect, dst_rect: Rect) {
         let clip_rect = Rect::new(0, 0, self.width, self.height);
         
         // Calculate intersection
@@ -1602,7 +1602,7 @@ struct FontGlyph {
 
 // Basic 8x16 bitmap font
 struct BitmapFont {
-    glyph_width: u8,
+    _glyph_width: u8,
     glyph_height: u8,
     glyphs: BTreeMap<char, FontGlyph>,
 }
@@ -1610,7 +1610,7 @@ struct BitmapFont {
 impl BitmapFont {
     fn new() -> Self {
         let mut font = BitmapFont {
-            glyph_width: 8,
+            _glyph_width: 8,
             glyph_height: 16,
             glyphs: BTreeMap::new(),
         };
@@ -2003,6 +2003,29 @@ pub fn clear_framebuffer(color: Color) -> Result<(), &'static str> {
     Err("Failed to access framebuffer compositor")
 }
 
+/// Process compositor frame for real-time compositor thread
+/// This function is called by the compositor RT thread to handle frame rendering with vsync timing
+pub fn process_compositor_frame() {
+    // Update window manager state
+    update_window_manager();
+    
+    // Render the current frame
+    render_frame();
+    
+    // Handle any pending compositor operations
+    // In a full implementation, this would:
+    // 1. Process damage regions for efficient rendering
+    // 2. Handle window composition and effects
+    // 3. Manage GPU command submission
+    // 4. Synchronize with display refresh rate
+    // 5. Handle triple buffering and vsync
+    
+    // For now, we just ensure the frame is rendered
+    // The render_frame() function already handles the compositor logic
+}
+
+
+
 pub fn blit_buffer(src_data: &[u8], dst_x: u32, dst_y: u32, width: u32, height: u32, stride: u32) -> Result<(), &'static str> {
     let mut compositor = FRAMEBUFFER_COMPOSITOR.lock();
     if let Some(ref mut comp) = compositor.as_mut() {
@@ -2056,7 +2079,7 @@ pub fn show_help_overlay() {
             buffer.clear(Color::new(40, 40, 60, 240)); // Semi-transparent dark blue
             
             // Draw help text (simplified)
-            let help_text = "RaeenOS Help\n\nF1 - Show this help\nF2 - Performance overlay\nF3 - Task manager\nESC - Cancel";
+            let _help_text = "RaeenOS Help\n\nF1 - Show this help\nF2 - Performance overlay\nF3 - Task manager\nESC - Cancel";
             // In a real implementation, this would render the text properly
         }
     }
@@ -2114,7 +2137,7 @@ pub fn update_cursor_position(x: i32, y: i32) {
     }
 }
 
-pub fn handle_window_drag(x: i32, y: i32, delta_x: i32, delta_y: i32) {
+pub fn handle_window_drag(x: i32, y: i32, _delta_x: i32, _delta_y: i32) {
     static mut DRAG_STATE: Option<(u32, i32, i32)> = None;
     
     unsafe {
@@ -2128,7 +2151,7 @@ pub fn handle_window_drag(x: i32, y: i32, delta_x: i32, delta_y: i32) {
 pub fn handle_mouse_hover(x: i32, y: i32) {
     // Handle mouse hover effects
     let wm = WINDOW_MANAGER.lock();
-    if let Some(window_id) = wm.get_window_at_point(Point::new(x, y)) {
+    if let Some(_window_id) = wm.get_window_at_point(Point::new(x, y)) {
         // Update hover state for window
         // In a real implementation, this would update visual feedback
     }

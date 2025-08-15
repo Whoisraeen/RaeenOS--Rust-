@@ -21,7 +21,7 @@ type BuiltinCommand = fn(&[&str]) -> ShellResult;
 // Shell session state
 #[derive(Debug, Clone)]
 struct ShellSession {
-    session_id: u32,
+    _session_id: u32,
     current_directory: String,
     environment: BTreeMap<String, String>,
     command_history: Vec<String>,
@@ -38,7 +38,7 @@ impl ShellSession {
         env.insert("SHELL".to_string(), "/bin/raeshell".to_string());
         
         Self {
-            session_id,
+            _session_id: session_id,
             current_directory: "/".to_string(),
             environment: env,
             command_history: Vec::new(),
@@ -142,7 +142,7 @@ fn cmd_cd(args: &[&str]) -> ShellResult {
     let path = args[1];
     
     // Validate path exists
-    match crate::fs::metadata(path) {
+    match crate::filesystem::metadata(path) {
         Ok(metadata) => {
             if metadata.file_type == crate::filesystem::FileType::Directory {
                 // Update current directory in session
@@ -238,18 +238,18 @@ fn cmd_cat(args: &[&str]) -> ShellResult {
     
     let filename = args[1];
     
-    match crate::fs::open_file(filename) {
+    match crate::filesystem::open_file(filename) {
         Ok(fd) => {
-            match crate::fs::read_file_fd(fd, 4096) {
+            match crate::filesystem::read_file_fd(fd, 4096) {
                 Ok(data) => {
-                    let _ = crate::fs::close_file(fd);
+                    let _ = crate::filesystem::close_file(fd);
                     match String::from_utf8(data) {
                         Ok(content) => ShellResult::Success(content),
                         Err(_) => ShellResult::Error("cat: file contains binary data".to_string()),
                     }
                 }
                 Err(_) => {
-                    let _ = crate::fs::close_file(fd);
+                    let _ = crate::filesystem::close_file(fd);
                     ShellResult::Error(format!("cat: cannot read '{}'", filename))
                 }
             }
@@ -265,7 +265,7 @@ fn cmd_touch(args: &[&str]) -> ShellResult {
     
     let filename = args[1];
     
-    match crate::fs::create_file(filename) {
+    match crate::filesystem::create_file(filename) {
         Ok(_) => ShellResult::Success(String::new()),
         Err(_) => ShellResult::Error(format!("touch: cannot create '{}'", filename)),
     }
@@ -278,7 +278,7 @@ fn cmd_rm(args: &[&str]) -> ShellResult {
     
     let filename = args[1];
     
-    match crate::fs::remove(filename) {
+    match crate::filesystem::remove(filename) {
         Ok(_) => ShellResult::Success(String::new()),
         Err(_) => ShellResult::Error(format!("rm: cannot remove '{}'", filename)),
     }
@@ -291,7 +291,7 @@ fn cmd_mkdir(args: &[&str]) -> ShellResult {
     
     let dirname = args[1];
     
-    match crate::fs::create_directory(dirname) {
+    match crate::filesystem::create_directory(dirname) {
         Ok(_) => ShellResult::Success(String::new()),
         Err(_) => ShellResult::Error(format!("mkdir: cannot create directory '{}'", dirname)),
     }
@@ -304,7 +304,7 @@ fn cmd_rmdir(args: &[&str]) -> ShellResult {
     
     let dirname = args[1];
     
-    match crate::fs::remove(dirname) {
+    match crate::filesystem::remove(dirname) {
         Ok(_) => ShellResult::Success(String::new()),
         Err(_) => ShellResult::Error(format!("rmdir: cannot remove directory '{}'", dirname)),
     }
@@ -319,24 +319,24 @@ fn cmd_cp(args: &[&str]) -> ShellResult {
     let dst = args[2];
     
     // Read source file
-    match crate::fs::open_file(src) {
+    match crate::filesystem::open_file(src) {
         Ok(src_fd) => {
-            match crate::fs::read_file_fd(src_fd, 65536) {
+            match crate::filesystem::read_file_fd(src_fd, 65536) {
                 Ok(data) => {
-                    let _ = crate::fs::close_file(src_fd);
+                    let _ = crate::filesystem::close_file(src_fd);
                     
                     // Write to destination
-                    match crate::fs::create_file(dst) {
+                    match crate::filesystem::create_file(dst) {
                         Ok(()) => {
-                            match crate::fs::open_file(dst) {
+                            match crate::filesystem::open_file(dst) {
                                 Ok(dst_fd) => {
-                                    match crate::fs::write_file(dst_fd, &data) {
+                                    match crate::filesystem::write_file(dst_fd, &data) {
                                         Ok(_) => {
-                                            let _ = crate::fs::close_file(dst_fd);
+                                            let _ = crate::filesystem::close_file(dst_fd);
                                             ShellResult::Success(String::new())
                                         }
                                         Err(_) => {
-                                            let _ = crate::fs::close_file(dst_fd);
+                                            let _ = crate::filesystem::close_file(dst_fd);
                                             ShellResult::Error(format!("cp: cannot write to '{}'", dst))
                                         }
                                     }
@@ -348,7 +348,7 @@ fn cmd_cp(args: &[&str]) -> ShellResult {
                     }
                 }
                 Err(_) => {
-                    let _ = crate::fs::close_file(src_fd);
+                    let _ = crate::filesystem::close_file(src_fd);
                     ShellResult::Error(format!("cp: cannot read '{}'", src))
                 }
             }
@@ -368,7 +368,7 @@ fn cmd_mv(args: &[&str]) -> ShellResult {
     // Copy then remove source
     match cmd_cp(&["cp", src, dst]) {
         ShellResult::Success(_) => {
-            match crate::fs::remove(src) {
+            match crate::filesystem::remove(src) {
                 Ok(_) => ShellResult::Success(String::new()),
                 Err(_) => ShellResult::Error(format!("mv: cannot remove '{}'", src)),
             }

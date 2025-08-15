@@ -1,10 +1,8 @@
 //! VESA VBE (Video BIOS Extensions) driver for RaeenOS
 //! Provides linear framebuffer setup for graphics mode
 
-use alloc::vec::Vec;
 use x86_64::VirtAddr;
 use x86_64::instructions::interrupts;
-use core::mem;
 use core::ptr;
 use spin::Mutex;
 use lazy_static::lazy_static;
@@ -125,7 +123,7 @@ impl VesaDriver {
         
         // Map the framebuffer to virtual memory
         let fb_phys = mode_info.phys_base_ptr as u64;
-        let fb_size = (mode_info.bytes_per_scanline as u32 * mode_info.y_resolution as u32) as u64;
+        let _fb_size = (mode_info.bytes_per_scanline as u32 * mode_info.y_resolution as u32) as u64;
         
         // For now, use identity mapping (this should be properly mapped through VMM)
         let fb_virt = VirtAddr::new(fb_phys);
@@ -234,7 +232,7 @@ impl VesaDriver {
     }
     
     /// Set VESA VBE mode
-    fn set_vbe_mode(&self, mode: u16) -> Result<(), &'static str> {
+    fn set_vbe_mode(&self, _mode: u16) -> Result<(), &'static str> {
         // In a real implementation, this would use BIOS interrupt 0x10
         // with AX=0x4F02 and BX=mode|0x4000 (linear framebuffer)
         // For now, we'll assume the mode is set successfully
@@ -287,7 +285,7 @@ impl VesaDriver {
     }
 }
 
-/// Global VESA driver instance
+// Global VESA driver instance
 lazy_static! {
     static ref VESA_DRIVER: Mutex<Option<VesaDriver>> = Mutex::new(None);
 }

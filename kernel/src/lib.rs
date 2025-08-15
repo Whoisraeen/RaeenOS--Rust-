@@ -9,13 +9,15 @@ pub mod interrupts;
 pub mod vmm;
 pub mod arch;
 pub mod apic;
-// pub mod uefi;
-// Temporarily keep other complex modules disabled until compiled individually
+pub mod uefi;
+pub mod pci;
+pub mod percpu;
 pub mod time;
 pub mod process;
 pub mod syscall;
 pub mod elf;
 pub mod filesystem;
+pub mod tarfs;
 pub use filesystem as fs;
 // pub mod drivers;
 // pub mod network;
@@ -27,12 +29,16 @@ pub mod network;
 pub mod ipc;
 pub mod ui;
 pub mod sound;
+pub mod input;
 pub mod security;
 pub mod rae_assistant;
 pub mod raeshell;
 pub mod raepkg;
 pub mod raede;
 pub mod raekit;
+pub mod slo;
+pub mod slo_tests;
+pub mod microkernel;
 
 extern crate alloc;
 
@@ -47,16 +53,27 @@ pub fn init(boot_info: &'static bootloader::BootInfo) {
     unsafe { memory::init_global_frame_allocator(&boot_info.memory_map) };
     let _ = heap::init_heap(&mut mapper, &mut frame_alloc);
     
-    // Initialize interrupts (legacy PIC mode for now)
-    // TODO: Re-enable APIC initialization once compilation issues are resolved
-    // if let Err(e) = apic::init() {
-    //     crate::serial::_print(format_args!("[APIC] Failed to initialize: {}\n", e));
-    //     // Fall back to legacy PIC mode
+    // Initialize per-CPU data structures
+    if let Err(e) = percpu::init() {
+        crate::serial::_print(format_args!("[PerCPU] Failed to initialize: {}\n", e));
+    }
+    
+    // Initialize APIC and PCI subsystems
+    if let Err(e) = apic::init() {
+        crate::serial::_print(format_args!("[APIC] Failed to initialize: {}\n", e));
+        // Fall back to legacy PIC mode
         interrupts::init();
-    // } else {
-    //     crate::serial::_print(format_args!("[APIC] Initialized successfully\n"));
-    //     interrupts::init_with_apic();
-    // }
+        time::init(); // Initialize timer without APIC
+    } else {
+        crate::serial::_print(format_args!("[APIC] Initialized successfully\n"));
+        interrupts::init_with_apic();
+        time::init_with_apic(); // Initialize timer with APIC and TSC deadline support
+    }
+    
+    // Initialize PCI subsystem with MSI-X support
+    if let Err(e) = pci::init() {
+        crate::serial::_print(format_args!("[PCI] Failed to initialize: {}\n", e));
+    }
     
     vmm::init();
     
@@ -74,34 +91,32 @@ pub fn init(boot_info: &'static bootloader::BootInfo) {
     
     syscall::init();
     
-    // Initialize graphics - use VESA for now
-    // TODO: Re-enable UEFI GOP initialization once compilation issues are resolved
-    let graphics_initialized = false;
-    // if let Some(framebuffer_info) = uefi::get_framebuffer_info() {
-    //     crate::serial::_print(format_args!("[UEFI] Using GOP framebuffer {}x{} at {:?}\n", 
-    //         framebuffer_info.width, framebuffer_info.height, framebuffer_info.base_addr));
-    //     
-    //     // Initialize framebuffer compositor with UEFI GOP framebuffer
-    //     let pitch = framebuffer_info.pixels_per_scanline * 4; // Assume 32-bit pixels
-    //     match graphics::init_framebuffer_compositor(
-    //         framebuffer_info.base_addr.as_u64() as *mut u8,
-    //         framebuffer_info.width,
-    //         framebuffer_info.height,
-    //         pitch,
-    //         32 // Assume 32-bit color depth
-    //     ) {
-    //         Ok(_) => {
-    //             crate::serial::_print(format_args!("[Graphics] UEFI GOP framebuffer compositor initialized\n"));
-    //             true
-    //         }
-    //         Err(e) => {
-    //             crate::serial::_print(format_args!("[Graphics] Failed to initialize UEFI GOP compositor: {}\n", e));
-    //             false
-    //         }
-    //     }
-    // } else {
-    //     false
-    // };
+    // Initialize graphics with UEFI GOP
+    let graphics_initialized = if let Some(framebuffer_info) = uefi::get_framebuffer_info() {
+        crate::serial::_print(format_args!("[UEFI] Using GOP framebuffer {}x{} at {:?}\n", 
+            framebuffer_info.width, framebuffer_info.height, framebuffer_info.base_addr));
+        
+        // Initialize framebuffer compositor with UEFI GOP framebuffer
+        let pitch = framebuffer_info.pixels_per_scanline * 4; // Assume 32-bit pixels
+        match graphics::init_framebuffer_compositor(
+            x86_64::VirtAddr::new(framebuffer_info.base_addr.as_u64()),
+            framebuffer_info.width,
+            framebuffer_info.height,
+            pitch,
+            32 // Assume 32-bit color depth
+        ) {
+            Ok(_) => {
+                crate::serial::_print(format_args!("[Graphics] UEFI GOP framebuffer compositor initialized\n"));
+                true
+            }
+            Err(e) => {
+                crate::serial::_print(format_args!("[Graphics] Failed to initialize UEFI GOP compositor: {}\n", e));
+                false
+            }
+        }
+    } else {
+        false
+    };
     
     // Fall back to VESA if UEFI GOP is not available
     if !graphics_initialized {
@@ -141,6 +156,10 @@ pub fn init(boot_info: &'static bootloader::BootInfo) {
     
     crate::serial::_print(format_args!("[Graphics] Initial frame rendered\n"));
     
+    // Initialize real-time threads for input, audio, and compositor
+    let _ = process::init_rt_threads();
+    crate::serial::_print(format_args!("[RT] Real-time threads initialized\n"));
+    
     // other subsystems init later
 }
 
@@ -176,7 +195,7 @@ fn show_boot_animation() {
         let _ = vesa::clear_screen(color);
         
         // Draw RaeenOS logo text in center
-        if let Ok(window_id) = graphics::create_boot_window() {
+        if let Ok(_window_id) = graphics::create_boot_window() {
             graphics::render_frame();
         }
         

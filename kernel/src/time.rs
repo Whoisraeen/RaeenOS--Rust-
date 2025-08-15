@@ -1,9 +1,12 @@
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicBool, Ordering};
 use x86_64::instructions::port::Port;
+use crate::arch::tsc;
+
 
 static SYSTEM_TIME: AtomicU64 = AtomicU64::new(0);
 static TIMER_FREQUENCY: AtomicU64 = AtomicU64::new(1000); // 1000 Hz default
 static UPTIME_TICKS: AtomicU64 = AtomicU64::new(0);
+static TSC_DEADLINE_ENABLED: AtomicBool = AtomicBool::new(false);
 
 // Real-time clock (RTC) ports
 const RTC_SECONDS: u16 = 0x00;
@@ -118,33 +121,49 @@ pub fn init() {
     let timestamp = rtc_time.to_timestamp();
     SYSTEM_TIME.store(timestamp, Ordering::SeqCst);
     
-    // Initialize PIT (Programmable Interval Timer) for regular timer interrupts
-    init_pit();
-    
-    // Calibrate TSC for high-precision timing
-    calibrate_tsc();
+    // Initialize TSC subsystem first
+    if let Ok(()) = tsc::init() {
+        crate::serial::_print(format_args!("[Timer] TSC initialized with frequency: {} Hz\n", tsc::get_frequency()));
+        
+        // Try to enable TSC-deadline timer if supported
+        if crate::arch::has_cpu_feature(crate::arch::CpuFeature::TscDeadline) {
+            init_tsc_deadline_timer();
+        } else {
+            crate::serial::_print(format_args!("[Timer] TSC-deadline not supported, falling back to PIT\n"));
+            init_pit();
+        }
+    } else {
+        crate::serial::_print(format_args!("[Timer] TSC initialization failed, using PIT\n"));
+        init_pit();
+        // Fallback TSC calibration for performance counters
+        calibrate_tsc_fallback();
+    }
 }
 
 /// Initialize timer with APIC support
-/// TODO: Re-enable once APIC module compilation is fixed
 pub fn init_with_apic() {
     // Read initial time from RTC
     let rtc_time = read_rtc();
     let timestamp = rtc_time.to_timestamp();
     SYSTEM_TIME.store(timestamp, Ordering::SeqCst);
     
-    // Calibrate TSC for high-precision timing
-    calibrate_tsc();
-    
-    // Fall back to PIT for now
-    init_pit();
-    
-    // TODO: Re-enable APIC timer initialization
-    // if crate::arch::has_cpu_feature(crate::arch::CpuFeature::TscDeadline) {
-    //     init_tsc_deadline_timer();
-    // } else {
-    //     init_apic_timer();
-    // }
+    // Initialize TSC subsystem first
+    if let Ok(()) = tsc::init() {
+        crate::serial::_print(format_args!("[Timer] TSC initialized with frequency: {} Hz\n", tsc::get_frequency()));
+        
+        // Enable TSC-deadline timer if supported
+        if crate::arch::has_cpu_feature(crate::arch::CpuFeature::TscDeadline) {
+            init_tsc_deadline_timer();
+        } else {
+            crate::serial::_print(format_args!("[Timer] TSC-deadline not supported, falling back to PIT\n"));
+            init_pit();
+        }
+    } else {
+        crate::serial::_print(format_args!("[Timer] TSC initialization failed, using PIT\n"));
+        init_pit();
+        // Fallback TSC calibration for performance counters
+        calibrate_tsc_fallback();
+    }
 }
 
 fn init_pit() {
@@ -169,37 +188,31 @@ fn init_pit() {
 }
 
 /// Initialize TSC-deadline timer
-/// TODO: Re-enable once APIC module is available
-#[allow(dead_code)]
 fn init_tsc_deadline_timer() {
-    // const TARGET_FREQUENCY: u64 = 1000; // 1000 Hz (1ms intervals)
-    // 
-    // let tsc_freq = TSC_FREQUENCY.load(Ordering::SeqCst);
-    // if tsc_freq > 0 {
-    //     let deadline_interval = tsc_freq / TARGET_FREQUENCY;
-    //     
-    //     // Configure APIC timer in TSC-deadline mode
-    //     if let Err(e) = crate::apic::set_timer_mode(crate::apic::TimerMode::TscDeadline) {
-    //         crate::serial::_print(format_args!("[Timer] Failed to set TSC-deadline mode: {}\n", e));
-    //         // Fall back to APIC timer
-    //         init_apic_timer();
-    //         return;
-    //     }
-    //     
-    //     // Set initial deadline
-    //     let current_tsc = read_tsc();
-    //     let deadline = current_tsc + deadline_interval;
-    //     crate::apic::set_timer_deadline(deadline);
-    //     
-    //     TIMER_FREQUENCY.store(TARGET_FREQUENCY, Ordering::SeqCst);
-    //     crate::serial::_print(format_args!("[Timer] TSC-deadline timer initialized at {} Hz\n", TARGET_FREQUENCY));
-    // } else {
-    //     crate::serial::_print(format_args!("[Timer] TSC not calibrated, falling back to APIC timer\n"));
-    //     init_apic_timer();
-    // }
+    const TARGET_FREQUENCY: u64 = 1000; // 1000 Hz (1ms intervals)
     
-    // Placeholder implementation - fall back to PIT
-    init_pit();
+    if !tsc::is_invariant_available() {
+        crate::serial::_print(format_args!("[Timer] Invariant TSC not available, falling back to PIT\n"));
+        init_pit();
+        return;
+    }
+    
+    let tsc_freq = tsc::get_frequency();
+    if tsc_freq > 0 {
+        let deadline_interval = tsc_freq / TARGET_FREQUENCY;
+        
+        // Set initial deadline
+        let current_tsc = tsc::read_tsc();
+        let deadline = current_tsc + deadline_interval;
+        tsc::deadline::set_deadline(deadline);
+        
+        TSC_DEADLINE_ENABLED.store(true, Ordering::SeqCst);
+        TIMER_FREQUENCY.store(TARGET_FREQUENCY, Ordering::SeqCst);
+        crate::serial::_print(format_args!("[Timer] TSC-deadline timer initialized at {} Hz\n", TARGET_FREQUENCY));
+    } else {
+        crate::serial::_print(format_args!("[Timer] TSC not calibrated, falling back to PIT\n"));
+        init_pit();
+    }
 }
 
 /// Initialize APIC timer in one-shot mode
@@ -240,16 +253,47 @@ pub fn tick() {
         SYSTEM_TIME.fetch_add(1, Ordering::SeqCst);
     }
     
-    // TODO: Re-enable TSC-deadline timer support once APIC module is available
-    // if crate::apic::is_initialized() && crate::arch::has_cpu_feature(crate::arch::CpuFeature::TscDeadline) {
-    //     let tsc_freq = TSC_FREQUENCY.load(Ordering::SeqCst);
-    //     if tsc_freq > 0 {
-    //         let deadline_interval = tsc_freq / frequency;
-    //         let current_tsc = read_tsc();
-    //         let next_deadline = current_tsc + deadline_interval;
-    //         crate::apic::set_timer_deadline(next_deadline);
-    //     }
-    // }
+    // Handle TSC-deadline timer if enabled (tickless mode)
+    if TSC_DEADLINE_ENABLED.load(Ordering::SeqCst) {
+        schedule_next_timer_deadline();
+    }
+}
+
+/// Schedule the next timer deadline based on scheduler requirements (tickless)
+pub fn schedule_next_timer_deadline() {
+    if !TSC_DEADLINE_ENABLED.load(Ordering::SeqCst) {
+        return;
+    }
+    
+    let tsc_freq = tsc::get_frequency();
+    if tsc_freq == 0 {
+        return;
+    }
+    
+    // Get the next deadline from the scheduler
+    let next_deadline_us = crate::process::get_next_scheduler_deadline_us();
+    
+    if next_deadline_us > 0 {
+        // Set TSC deadline timer for the calculated deadline
+        tsc::deadline::set_deadline_us(next_deadline_us);
+    } else {
+        // No specific deadline needed, use default 1ms interval
+        tsc::deadline::set_deadline_us(1000);
+    }
+}
+
+/// Set a one-shot timer for a specific deadline in microseconds
+pub fn set_timer_deadline_us(us: u64) {
+    if TSC_DEADLINE_ENABLED.load(Ordering::SeqCst) {
+        tsc::deadline::set_deadline_us(us);
+    }
+}
+
+/// Clear any pending timer deadline
+pub fn clear_timer_deadline() {
+    if TSC_DEADLINE_ENABLED.load(Ordering::SeqCst) {
+        tsc::deadline::clear_deadline();
+    }
 }
 
 pub fn get_timestamp() -> u64 {
@@ -288,17 +332,19 @@ pub fn sleep_seconds(seconds: u64) {
 }
 
 // High-precision timer using TSC (Time Stamp Counter)
-static TSC_FREQUENCY: AtomicU64 = AtomicU64::new(0);
+// Legacy TSC frequency for fallback calibration
+static TSC_FREQUENCY_FALLBACK: AtomicU64 = AtomicU64::new(0);
 
-pub fn calibrate_tsc() {
+/// Fallback TSC calibration for performance counters when arch TSC init fails
+pub fn calibrate_tsc_fallback() {
     // Calibrate TSC frequency using PIT
-    let start_tsc = read_tsc();
+    let start_tsc = tsc::read_tsc();
     let start_time = get_uptime_ms();
     
     // Wait for 100ms
     sleep_ms(100);
     
-    let end_tsc = read_tsc();
+    let end_tsc = tsc::read_tsc();
     let end_time = get_uptime_ms();
     
     let elapsed_ms = end_time - start_time;
@@ -306,34 +352,43 @@ pub fn calibrate_tsc() {
     
     if elapsed_ms > 0 {
         let tsc_freq = (tsc_diff * 1000) / elapsed_ms;
-        TSC_FREQUENCY.store(tsc_freq, Ordering::SeqCst);
+        TSC_FREQUENCY_FALLBACK.store(tsc_freq, Ordering::SeqCst);
+        crate::serial::_print(format_args!("[Timer] Fallback TSC calibrated at {} Hz\n", tsc_freq));
     }
 }
 
-fn read_tsc() -> u64 {
-    unsafe {
-        let mut low: u32;
-        let mut high: u32;
-        core::arch::asm!(
-            "rdtsc",
-            out("eax") low,
-            out("edx") high,
-            options(nomem, nostack)
-        );
-        ((high as u64) << 32) | (low as u64)
+/// Get TSC frequency (prefer arch module, fallback to local calibration)
+fn get_tsc_frequency() -> u64 {
+    let arch_freq = tsc::get_frequency();
+    if arch_freq > 0 {
+        arch_freq
+    } else {
+        TSC_FREQUENCY_FALLBACK.load(Ordering::SeqCst)
     }
 }
 
 pub fn get_precise_time_ns() -> u64 {
-    let tsc = read_tsc();
-    let freq = TSC_FREQUENCY.load(Ordering::SeqCst);
-    
-    if freq > 0 {
-        (tsc * 1_000_000_000) / freq
+    if tsc::is_invariant_available() {
+        // Use arch module TSC functions for best precision
+        let current_tsc = tsc::read_tsc();
+        tsc::ticks_to_ns(current_tsc)
     } else {
-        // Fallback to millisecond precision
-        get_uptime_ms() * 1_000_000
+        // Fallback to local TSC calibration
+        let current_tsc = tsc::read_tsc();
+        let freq = get_tsc_frequency();
+        
+        if freq > 0 {
+            (current_tsc * 1_000_000_000) / freq
+        } else {
+            // Fallback to millisecond precision
+            get_uptime_ms() * 1_000_000
+        }
     }
+}
+
+/// Get timestamp in nanoseconds for SLO measurements
+pub fn get_timestamp_ns() -> u64 {
+    get_precise_time_ns()
 }
 
 // Performance measurement utilities
@@ -345,21 +400,27 @@ pub struct PerformanceCounter {
 impl PerformanceCounter {
     pub fn new() -> Self {
         Self {
-            start_tsc: read_tsc(),
+            start_tsc: tsc::read_tsc(),
             start_time: get_uptime_ms(),
         }
     }
     
     pub fn elapsed_ns(&self) -> u64 {
-        let current_tsc = read_tsc();
-        let freq = TSC_FREQUENCY.load(Ordering::SeqCst);
+        let current_tsc = tsc::read_tsc();
         
-        if freq > 0 {
+        if tsc::is_invariant_available() {
             let tsc_diff = current_tsc - self.start_tsc;
-            (tsc_diff * 1_000_000_000) / freq
+            tsc::ticks_to_ns(tsc_diff)
         } else {
-            let time_diff = get_uptime_ms() - self.start_time;
-            time_diff * 1_000_000
+            let freq = get_tsc_frequency();
+            
+            if freq > 0 {
+                let tsc_diff = current_tsc - self.start_tsc;
+                (tsc_diff * 1_000_000_000) / freq
+            } else {
+                let time_diff = get_uptime_ms() - self.start_time;
+                time_diff * 1_000_000
+            }
         }
     }
     

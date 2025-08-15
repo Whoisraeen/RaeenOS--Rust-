@@ -3,7 +3,7 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use alloc::boxed::Box;
 use core::fmt;
-use spin::{Mutex, RwLock};
+use spin::RwLock;
 use x86_64::instructions::port::Port;
 use x86_64::VirtAddr;
 
@@ -166,7 +166,7 @@ pub struct VgaDriver {
     framebuffer: VirtAddr,
     width: u32,
     height: u32,
-    bpp: u8, // bits per pixel
+    _bpp: u8, // bits per pixel
     status: DeviceStatus,
 }
 
@@ -176,7 +176,7 @@ impl VgaDriver {
             framebuffer: VirtAddr::new(0xB8000), // VGA text mode buffer
             width: 80,
             height: 25,
-            bpp: 4, // 4 bits per character (16 colors)
+            _bpp: 4, // 4 bits per character (16 colors)
             status: DeviceStatus::Uninitialized,
         }
     }
@@ -277,7 +277,7 @@ pub struct AtaDriver {
 
 #[derive(Debug, Clone)]
 struct AtaDrive {
-    sectors: u64,
+    _sectors: u64,
     is_master: bool,
     base_port: u16,
 }
@@ -324,7 +324,7 @@ impl AtaDriver {
             let sectors = ((buffer[61] as u64) << 16) | (buffer[60] as u64);
             
             Some(AtaDrive {
-                sectors,
+                _sectors: sectors,
                 is_master,
                 base_port: base,
             })
@@ -663,7 +663,7 @@ pub fn handle_device_interrupt(irq: u8) -> DeviceResult<()> {
 }
 
 // Graphics API
-pub fn clear_screen(color: u8) {
+pub fn clear_screen(_color: u8) {
     let manager = DEVICE_MANAGER.read();
     let graphics_devices = manager.get_devices_by_type(DeviceType::Graphics);
     
@@ -680,7 +680,7 @@ pub fn clear_screen(color: u8) {
 }
 
 // Storage API
-pub fn read_disk_sector(drive: u8, lba: u64, buffer: &mut [u8]) -> DeviceResult<()> {
+pub fn read_disk_sector(_drive: u8, _lba: u64, _buffer: &mut [u8]) -> DeviceResult<()> {
     let mut manager = DEVICE_MANAGER.write();
     let storage_devices = manager.get_devices_by_type(DeviceType::Storage);
     
@@ -696,7 +696,7 @@ pub fn read_disk_sector(drive: u8, lba: u64, buffer: &mut [u8]) -> DeviceResult<
     Err(DeviceError::NotFound)
 }
 
-pub fn write_disk_sector(drive: u8, lba: u64, buffer: &[u8]) -> DeviceResult<()> {
+pub fn write_disk_sector(_drive: u8, _lba: u64, _buffer: &[u8]) -> DeviceResult<()> {
     let mut manager = DEVICE_MANAGER.write();
     let storage_devices = manager.get_devices_by_type(DeviceType::Storage);
     

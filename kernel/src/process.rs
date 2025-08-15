@@ -1,15 +1,15 @@
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
-use alloc::string::{String, ToString};
+use alloc::string::ToString;
 use core::ops::DerefMut;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use spin::{Mutex, Once};
 use x86_64::{VirtAddr, PhysAddr};
-use crate::arch::{detect_cpu_info, get_cpu_count, get_current_cpu_id};
+use crate::arch::{get_cpu_count, get_current_cpu_id};
 
 static NEXT_PID: AtomicU64 = AtomicU64::new(1);
 static SMP_SCHEDULER: Once<Mutex<SmpScheduler>> = Once::new();
-static LEGACY_SCHEDULER: Mutex<Scheduler> = Mutex::new(Scheduler::new());
+static _LEGACY_SCHEDULER: Mutex<Scheduler> = Mutex::new(Scheduler::new());
 static IDLE_THREAD_PID: AtomicU64 = AtomicU64::new(0);
 
 pub type ProcessId = u64;
@@ -44,7 +44,7 @@ fn default_signal_handler(signal: Signal) {
         }
         Signal::SIGSTOP => {
             // Block the current process
-            let current_pid = get_current_process_id();
+            let _current_pid = get_current_process_id();
             let cpu_id = get_current_cpu_id();
             get_smp_scheduler().lock().block_current_on_cpu(cpu_id);
         }
@@ -76,6 +76,33 @@ pub enum RtClass {
     BestEffort,
 }
 
+/// Priority inheritance state for IPC operations
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PriorityInheritanceState {
+    None,
+    Inherited { original_priority: Priority, inherited_from: u64 },
+    Boosted { boost_level: u8 },
+}
+
+/// NUMA node information
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NumaNode {
+    pub id: u8,
+    pub cpu_mask: u64,
+    pub memory_base: u64,
+    pub memory_size: u64,
+}
+
+/// CBS (Constant Bandwidth Server) parameters
+#[derive(Debug, Clone, Copy)]
+pub struct CbsParams {
+    pub server_budget_us: u64,
+    pub server_period_us: u64,
+    pub remaining_budget: u64,
+    pub next_replenishment: u64,
+    pub throttled: bool,
+}
+
 /// Real-time scheduling parameters
 #[derive(Debug, Clone, Copy)]
 pub struct RtParams {
@@ -86,6 +113,8 @@ pub struct RtParams {
     pub remaining_budget: u64, // Remaining budget in current period
     pub next_deadline: u64,   // Absolute deadline timestamp
     pub last_replenish: u64,  // Last budget replenishment time
+    pub cbs_params: Option<CbsParams>, // CBS server parameters
+    pub priority_inheritance: PriorityInheritanceState, // Priority inheritance state
 }
 
 impl Default for RtParams {
@@ -98,6 +127,8 @@ impl Default for RtParams {
             remaining_budget: 0,
             next_deadline: 0,
             last_replenish: 0,
+            cbs_params: None,
+            priority_inheritance: PriorityInheritanceState::None,
         }
     }
 }
@@ -192,7 +223,8 @@ pub struct Process {
     // Keep kernel stack backing alive for kernel threads
     pub kernel_stack_ptr: Option<usize>, // Store as usize to make it Send
     pub cpu_affinity: CpuAffinity, // CPU affinity for SMP scheduling
-    pub rt_params: RtParams, // Real-time scheduling parameters
+    pub rt_params: RtParams,
+    pub numa_node: Option<NumaNode>, // Real-time scheduling parameters
 }
 
 #[derive(Debug, Clone)]
@@ -257,8 +289,9 @@ impl Process {
             pending_signals: 0,
             signal_handlers: [None; 32],
             kernel_stack_ptr: None,
-            cpu_affinity: CpuAffinity::Any,
+            cpu_affinity: CpuAffinity::ANY,
             rt_params: RtParams::default(),
+            numa_node: None,
         }
     }
     
@@ -307,7 +340,7 @@ impl Process {
                     user_stack_base,
                     user_stack_top,
                     crate::vmm::VmAreaType::Stack,
-                    crate::vmm::VmPermissions::Read | crate::vmm::VmPermissions::Write | crate::vmm::VmPermissions::User,
+                    crate::vmm::VmPermissions::READ | crate::vmm::VmPermissions::WRITE | crate::vmm::VmPermissions::USER,
                 );
                 address_space.add_area(stack_area)?;
             }
@@ -340,8 +373,9 @@ impl Process {
                 sandbox_level: SandboxLevel::Strict,
             },
             kernel_stack_ptr: None,
-            cpu_affinity: CpuAffinity::Any,
+            cpu_affinity: CpuAffinity::ANY,
             rt_params: RtParams::default(),
+            numa_node: None,
         })
      }
 }
@@ -389,7 +423,7 @@ impl CpuAffinity {
 
 /// Per-CPU scheduler data
 pub struct CpuScheduler {
-    cpu_id: u32,
+    _cpu_id: u32,
     ready_queues: [VecDeque<u64>; 4], // One queue per priority level
     rt_edf_queue: VecDeque<u64>,      // EDF real-time queue (sorted by deadline)
     rt_cbs_queue: VecDeque<u64>,      // CBS real-time queue
@@ -398,14 +432,17 @@ pub struct CpuScheduler {
     current_time_slice_remaining: u64,
     idle_thread_pid: Option<u64>,
     load: AtomicU32, // Current load (number of ready processes)
-    last_balance_time: u64,
+    _last_balance_time: u64,
     rt_isolated: bool, // Whether this CPU is isolated for RT tasks
+    numa_node: Option<NumaNode>, // NUMA node this CPU belongs to
+    cbs_budget_tracker: alloc::collections::BTreeMap<u64, u64>, // Track CBS budget usage
+    priority_inheritance_chains: alloc::collections::BTreeMap<u64, Vec<u64>>, // PI chains
 }
 
 impl CpuScheduler {
-    pub const fn new(cpu_id: u32) -> Self {
+    pub fn new(cpu_id: u32) -> Self {
         Self {
-            cpu_id,
+            _cpu_id: cpu_id,
             ready_queues: [
                 VecDeque::new(), VecDeque::new(),
                 VecDeque::new(), VecDeque::new()
@@ -417,8 +454,11 @@ impl CpuScheduler {
             current_time_slice_remaining: 10,
             idle_thread_pid: None,
             load: AtomicU32::new(0),
-            last_balance_time: 0,
+            _last_balance_time: 0,
             rt_isolated: false,
+            numa_node: None,
+            cbs_budget_tracker: alloc::collections::BTreeMap::new(),
+            priority_inheritance_chains: alloc::collections::BTreeMap::new(),
         }
     }
     
@@ -483,11 +523,9 @@ impl CpuScheduler {
             if let Some(pos) = self.rt_edf_queue.iter().position(|&p| p == pid) {
                 self.rt_edf_queue.remove(pos);
                 self.load.fetch_sub(1, Ordering::Relaxed);
-                found = true;
             } else if let Some(pos) = self.rt_cbs_queue.iter().position(|&p| p == pid) {
                 self.rt_cbs_queue.remove(pos);
                 self.load.fetch_sub(1, Ordering::Relaxed);
-                found = true;
             }
         }
         
@@ -496,24 +534,61 @@ impl CpuScheduler {
         }
     }
     
-    pub fn schedule(&mut self, gaming_mode: bool) -> Option<u64> {
+    pub fn schedule(&mut self, gaming_mode: bool, processes: &[Option<Process>]) -> Option<u64> {
         let current_time = crate::time::get_uptime_ms() * 1000; // Convert to microseconds
         
         // 1. Real-time EDF scheduling (highest priority)
-        if let Some(pid) = self.rt_edf_queue.front().copied() {
-            self.rt_edf_queue.pop_front();
+        // Find the process with the earliest deadline that has remaining budget
+        let mut earliest_deadline = u64::MAX;
+        let mut selected_edf_pid = None;
+        let mut edf_index = None;
+        
+        for (i, &pid) in self.rt_edf_queue.iter().enumerate() {
+            if let Some(process) = processes.get(pid as usize).and_then(|p| p.as_ref()) {
+                // Only schedule if process has remaining budget and hasn't missed deadline
+                if process.rt_params.remaining_budget > 0 && 
+                   process.rt_params.next_deadline > current_time &&
+                   process.rt_params.next_deadline < earliest_deadline {
+                    earliest_deadline = process.rt_params.next_deadline;
+                    selected_edf_pid = Some(pid);
+                    edf_index = Some(i);
+                }
+            }
+        }
+        
+        if let (Some(pid), Some(index)) = (selected_edf_pid, edf_index) {
+            self.rt_edf_queue.remove(index);
+            self.rt_edf_queue.push_back(pid); // Move to end for fairness
             self.current_process = Some(pid);
-            self.current_time_slice_remaining = 1; // Short slice for RT tasks
+            // Use remaining budget or 100µs, whichever is smaller
+            if let Some(process) = processes.get(pid as usize).and_then(|p| p.as_ref()) {
+                self.current_time_slice_remaining = core::cmp::min(process.rt_params.remaining_budget / 1000, 100);
+            } else {
+                self.current_time_slice_remaining = 1;
+            }
             return Some(pid);
         }
         
         // 2. Real-time CBS scheduling
-        if let Some(pid) = self.rt_cbs_queue.pop_front() {
-            // Re-add to end for round-robin within CBS
-            self.rt_cbs_queue.push_back(pid);
-            self.current_process = Some(pid);
-            self.current_time_slice_remaining = 2; // Slightly longer for CBS
-            return Some(pid);
+        // CBS processes get bandwidth-controlled execution
+        let mut cbs_candidates = Vec::new();
+        for (i, &pid) in self.rt_cbs_queue.iter().enumerate() {
+            if let Some(process) = processes.get(pid as usize).and_then(|p| p.as_ref()) {
+                // Check if CBS process has budget available
+                if process.rt_params.remaining_budget > 0 {
+                    cbs_candidates.push((i, pid, process.rt_params.remaining_budget));
+                }
+            }
+        }
+        
+        if let Some((index, pid, remaining_budget)) = cbs_candidates.first() {
+            // Move to end of CBS queue for round-robin
+            self.rt_cbs_queue.remove(*index);
+            self.rt_cbs_queue.push_back(*pid);
+            self.current_process = Some(*pid);
+            // CBS gets smaller time slices for bandwidth control
+            self.current_time_slice_remaining = core::cmp::min(remaining_budget / 1000, 50);
+            return Some(*pid);
         }
         
         // 3. Gaming mode prioritization (if no RT tasks)
@@ -552,35 +627,77 @@ impl CpuScheduler {
         let current_time = crate::time::get_uptime_ms() * 1000; // Convert to microseconds
         
         // Update EDF processes
-        let mut expired_pids = Vec::new();
+        let mut deadline_missed_pids = Vec::new();
+        let mut budget_exhausted_pids = Vec::new();
+        
         for &pid in &self.rt_edf_queue {
             if let Some(process) = processes.get_mut(pid as usize).and_then(|p| p.as_mut()) {
                 // Check for deadline miss
                 if current_time > process.rt_params.next_deadline {
-                    expired_pids.push(pid);
-                    // Update to next period
-                    process.rt_params.next_deadline += process.rt_params.period_us;
+                    deadline_missed_pids.push(pid);
+                    // Log deadline miss for debugging
+                    crate::serial_println!("EDF deadline miss: PID {} missed deadline by {}µs", 
+                                         pid, current_time - process.rt_params.next_deadline);
+                    
+                    // Update to next period and replenish budget
+                    while process.rt_params.next_deadline <= current_time {
+                        process.rt_params.next_deadline += process.rt_params.period_us;
+                    }
                     process.rt_params.remaining_budget = process.rt_params.budget_us;
+                }
+                
+                // Check for budget exhaustion
+                if process.rt_params.remaining_budget == 0 {
+                    budget_exhausted_pids.push(pid);
                 }
             }
         }
         
-        // Remove expired processes and re-add them (they'll be re-sorted by deadline)
-        for pid in expired_pids {
-            self.remove_process(pid);
+        // Remove processes that missed deadlines or exhausted budget
+        for pid in deadline_missed_pids.iter().chain(budget_exhausted_pids.iter()) {
+            if let Some(pos) = self.rt_edf_queue.iter().position(|&p| p == *pid) {
+                self.rt_edf_queue.remove(pos);
+            }
+        }
+        
+        // Re-add deadline-missed processes (they get new deadlines)
+        for pid in deadline_missed_pids {
             if let Some(process) = processes.get(pid as usize).and_then(|p| p.as_ref()) {
                 self.add_rt_process(pid, process.rt_params.class, processes);
             }
         }
         
         // Update CBS processes
+        let mut cbs_replenish_pids = Vec::new();
+        let mut cbs_exhausted_pids = Vec::new();
+        
         for &pid in &self.rt_cbs_queue {
             if let Some(process) = processes.get_mut(pid as usize).and_then(|p| p.as_mut()) {
                 // Replenish budget if period elapsed
                 if current_time >= process.rt_params.next_deadline {
+                    cbs_replenish_pids.push(pid);
                     process.rt_params.remaining_budget = process.rt_params.budget_us;
                     process.rt_params.next_deadline += process.rt_params.period_us;
                 }
+                
+                // Mark for removal from CBS queue if budget exhausted
+                if process.rt_params.remaining_budget == 0 {
+                    cbs_exhausted_pids.push(pid);
+                }
+            }
+        }
+        
+        // Remove budget-exhausted CBS processes
+        for pid in cbs_exhausted_pids {
+            if let Some(pos) = self.rt_cbs_queue.iter().position(|&p| p == pid) {
+                self.rt_cbs_queue.remove(pos);
+            }
+        }
+        
+        // Re-add CBS processes that got budget replenished
+        for pid in cbs_replenish_pids {
+            if !self.rt_cbs_queue.contains(&pid) {
+                self.rt_cbs_queue.push_back(pid);
             }
         }
     }
@@ -610,6 +727,55 @@ impl CpuScheduler {
             self.current_time_slice_remaining -= 1;
         }
         self.current_time_slice_remaining == 0
+    }
+    
+    /// Set time slice for current process (for dynamic scheduling)
+    pub fn set_time_slice(&mut self, time_slice_ms: u32) {
+        self.time_slice = time_slice_ms as u64;
+        self.current_time_slice_remaining = time_slice_ms as u64;
+    }
+    
+    /// Get remaining time slice in milliseconds
+    pub fn get_remaining_time_slice(&self) -> u32 {
+        self.current_time_slice_remaining as u32
+    }
+    
+    /// Update real-time process deadlines
+    pub fn update_rt_deadlines(&mut self, processes: &mut [Option<Process>], current_time_us: u64) {
+        // Update EDF queue deadlines
+        for &pid in &self.rt_edf_queue {
+            if let Some(process) = processes.get_mut(pid as usize).and_then(|p| p.as_mut()) {
+                if current_time_us >= process.rt_params.next_deadline {
+                    // Deadline missed, update to next period
+                    process.rt_params.next_deadline += process.rt_params.period_us;
+                    process.rt_params.remaining_budget = process.rt_params.budget_us;
+                }
+            }
+        }
+        
+        // Update CBS queue budgets
+        for &pid in &self.rt_cbs_queue {
+            if let Some(process) = processes.get_mut(pid as usize).and_then(|p| p.as_mut()) {
+                if current_time_us >= process.rt_params.next_deadline {
+                    // Replenish budget for next period
+                    process.rt_params.next_deadline += process.rt_params.period_us;
+                    process.rt_params.remaining_budget = process.rt_params.budget_us;
+                }
+            }
+        }
+        
+        // Re-sort EDF queue by deadline
+        self.rt_edf_queue.make_contiguous().sort_by(|&a, &b| {
+            let deadline_a = processes.get(a as usize)
+                .and_then(|p| p.as_ref())
+                .map(|p| p.rt_params.next_deadline)
+                .unwrap_or(u64::MAX);
+            let deadline_b = processes.get(b as usize)
+                .and_then(|p| p.as_ref())
+                .map(|p| p.rt_params.next_deadline)
+                .unwrap_or(u64::MAX);
+            deadline_a.cmp(&deadline_b)
+        });
     }
     
     pub fn set_idle_thread(&mut self, pid: u64) {
@@ -643,6 +809,97 @@ impl CpuScheduler {
             self.current_process = None;
         }
     }
+
+    // Priority inheritance methods
+    pub fn inherit_priority(&mut self, pid: u64, from_pid: u64, processes: &mut [Option<Process>]) {
+        // First, get the priority from the source process
+        let from_priority = if let Some(from_process) = processes.get(from_pid as usize).and_then(|p| p.as_ref()) {
+            from_process.priority
+        } else {
+            return;
+        };
+        
+        // Then modify the target process
+        if let Some(process) = processes.get_mut(pid as usize).and_then(|p| p.as_mut()) {
+            match process.rt_params.priority_inheritance {
+                PriorityInheritanceState::None => {
+                    process.rt_params.priority_inheritance = PriorityInheritanceState::Inherited {
+                        original_priority: process.priority,
+                        inherited_from: from_pid,
+                    };
+                    process.priority = from_priority;
+                    
+                    // Track inheritance chain
+                    self.priority_inheritance_chains.entry(from_pid).or_insert_with(Vec::new).push(pid);
+                }
+                _ => {} // Already inheriting, don't override
+            }
+        }
+    }
+
+    pub fn restore_priority(&mut self, pid: u64, processes: &mut [Option<Process>]) {
+        if let Some(process) = processes.get_mut(pid as usize).and_then(|p| p.as_mut()) {
+            if let PriorityInheritanceState::Inherited { original_priority, inherited_from } = process.rt_params.priority_inheritance {
+                process.priority = original_priority;
+                process.rt_params.priority_inheritance = PriorityInheritanceState::None;
+                
+                // Remove from inheritance chain
+                if let Some(chain) = self.priority_inheritance_chains.get_mut(&inherited_from) {
+                    chain.retain(|&p| p != pid);
+                    if chain.is_empty() {
+                        self.priority_inheritance_chains.remove(&inherited_from);
+                    }
+                }
+            }
+        }
+    }
+
+    // CBS throttling methods
+    pub fn update_cbs_budget(&mut self, pid: u64, consumed_us: u64, processes: &mut [Option<Process>]) {
+        if let Some(process) = processes.get_mut(pid as usize).and_then(|p| p.as_mut()) {
+            if let Some(ref mut cbs_params) = process.rt_params.cbs_params {
+                if cbs_params.remaining_budget >= consumed_us {
+                    cbs_params.remaining_budget -= consumed_us;
+                } else {
+                    cbs_params.remaining_budget = 0;
+                    cbs_params.throttled = true;
+                }
+                
+                // Track budget usage
+                *self.cbs_budget_tracker.entry(pid).or_insert(0) += consumed_us;
+            }
+        }
+    }
+
+    pub fn replenish_cbs_budget(&mut self, current_time_us: u64, processes: &mut [Option<Process>]) {
+        for process_opt in processes.iter_mut() {
+            if let Some(process) = process_opt {
+                if let Some(ref mut cbs_params) = process.rt_params.cbs_params {
+                    if current_time_us >= cbs_params.next_replenishment {
+                        cbs_params.remaining_budget = cbs_params.server_budget_us;
+                        cbs_params.next_replenishment = current_time_us + cbs_params.server_period_us;
+                        cbs_params.throttled = false;
+                    }
+                }
+            }
+        }
+    }
+
+    // NUMA-aware scheduling methods
+    pub fn set_numa_node(&mut self, numa_node: NumaNode) {
+        self.numa_node = Some(numa_node);
+    }
+
+    pub fn get_numa_node(&self) -> Option<NumaNode> {
+        self.numa_node
+    }
+
+    pub fn is_numa_local(&self, process: &Process) -> bool {
+        match (self.numa_node, process.numa_node) {
+            (Some(cpu_node), Some(process_node)) => cpu_node.id == process_node.id,
+            _ => true, // If NUMA info is not available, assume local
+        }
+    }
 }
 
 /// Global SMP-aware scheduler
@@ -651,7 +908,7 @@ pub struct SmpScheduler {
     processes: Vec<Option<Process>>,
     gaming_mode: bool,
     num_cpus: u32,
-    current_cpu: AtomicU32,
+    _current_cpu: AtomicU32,
 }
 
 impl SmpScheduler {
@@ -668,7 +925,7 @@ impl SmpScheduler {
             processes: Vec::new(),
             gaming_mode: false,
             num_cpus,
-            current_cpu: AtomicU32::new(0),
+            _current_cpu: AtomicU32::new(0),
         }
     }
     
@@ -713,7 +970,7 @@ impl SmpScheduler {
             return None;
         }
         
-        self.cpu_schedulers[cpu_id as usize].lock().schedule(self.gaming_mode)
+        self.cpu_schedulers[cpu_id as usize].lock().schedule(self.gaming_mode, &self.processes)
     }
     
     pub fn find_best_cpu_for_process(&self, process: &Process) -> Option<u32> {
@@ -751,8 +1008,8 @@ impl SmpScheduler {
             
             if max_load > min_load + 2 {
                 // Move one process from the most loaded CPU to the least loaded CPU
-                let src_cpu = loads[loads.len() - 1].0;
-                let dst_cpu = loads[0].0;
+                let _src_cpu = loads[loads.len() - 1].0;
+                let _dst_cpu = loads[0].0;
                 
                 // This is a simplified implementation - in practice, we'd need more
                 // sophisticated logic to migrate processes safely
@@ -781,7 +1038,7 @@ impl SmpScheduler {
     
     pub fn set_process_affinity(&mut self, pid: u64, affinity: CpuAffinity) -> bool {
         if let Some(process) = self.processes.get_mut(pid as usize).and_then(|p| p.as_mut()) {
-            let old_affinity = process.cpu_affinity;
+            let _old_affinity = process.cpu_affinity;
             process.cpu_affinity = affinity;
             
             // If the process can no longer run on its current CPU, migrate it
@@ -824,6 +1081,163 @@ impl SmpScheduler {
         self.cpu_schedulers[cpu_id as usize].lock().tick_time_slice()
     }
     
+    /// Update real-time deadlines for all CPUs (called periodically)
+    pub fn update_all_rt_deadlines(&mut self) {
+        let current_time_us = crate::time::get_precise_time_ns() / 1000;
+        
+        for cpu_scheduler in &mut self.cpu_schedulers {
+            cpu_scheduler.lock().update_rt_deadlines(&mut self.processes, current_time_us);
+        }
+    }
+    
+    /// Set dynamic time slice for better responsiveness
+    pub fn set_dynamic_time_slice(&mut self, cpu_id: u32, time_slice_ms: u32) {
+        if let Some(cpu_scheduler) = self.cpu_schedulers.get_mut(cpu_id as usize) {
+            cpu_scheduler.lock().set_time_slice(time_slice_ms);
+        }
+    }
+    
+    /// Get the earliest deadline across all CPUs for tickless scheduling
+    pub fn get_earliest_deadline_us(&self) -> u64 {
+        let current_time_us = crate::time::get_precise_time_ns() / 1000;
+        let mut earliest_deadline = u64::MAX;
+        
+        for cpu_scheduler in &self.cpu_schedulers {
+            let scheduler = cpu_scheduler.lock();
+            
+            // Check EDF queue for earliest deadline (only processes with budget)
+            for &pid in &scheduler.rt_edf_queue {
+                if let Some(process) = self.processes.get(pid as usize).and_then(|p| p.as_ref()) {
+                    // Only consider processes with remaining budget
+                    if process.rt_params.remaining_budget > 0 && 
+                       process.rt_params.next_deadline < earliest_deadline {
+                        earliest_deadline = process.rt_params.next_deadline;
+                    }
+                }
+            }
+            
+            // Check current process time slice
+            if scheduler.current_process.is_some() {
+                let remaining_us = (scheduler.current_time_slice_remaining * 1000) as u64;
+                let time_slice_deadline = current_time_us + remaining_us;
+                if time_slice_deadline < earliest_deadline {
+                    earliest_deadline = time_slice_deadline;
+                }
+            }
+        }
+        
+        if earliest_deadline == u64::MAX {
+            1000 // Default 1ms
+        } else if earliest_deadline <= current_time_us {
+            1 // Schedule immediately
+        } else {
+            earliest_deadline - current_time_us
+        }
+    }
+    
+    /// Check if a CPU core should be isolated for RT threads
+    pub fn is_rt_core(&self, cpu_id: u8) -> bool {
+        // Cores 2 and 3 are reserved for RT threads (input, audio, compositor)
+        cpu_id >= 2 && cpu_id <= 3
+    }
+    
+    /// Get the preferred CPU core for an RT thread type
+    pub fn get_rt_cpu_affinity(&self, rt_class: RtClass) -> Option<u8> {
+        match rt_class {
+            RtClass::Edf => Some(2), // Input thread on core 2
+            RtClass::Cbs => Some(3), // Audio/compositor on core 3
+            _ => None,
+        }
+    }
+    
+    /// Migrate RT process to its preferred core
+    pub fn migrate_rt_process(&mut self, pid: u64, target_cpu: u8) {
+        if target_cpu as usize >= self.cpu_schedulers.len() {
+            return;
+        }
+        
+        // Remove from current CPU scheduler
+        for (cpu_id, cpu_scheduler) in self.cpu_schedulers.iter().enumerate() {
+            let mut scheduler = cpu_scheduler.lock();
+            
+            // Remove from EDF queue
+            if let Some(pos) = scheduler.rt_edf_queue.iter().position(|&p| p == pid) {
+                scheduler.rt_edf_queue.remove(pos);
+                
+                // Add to target CPU
+                if cpu_id != target_cpu as usize {
+                    drop(scheduler);
+                    let mut target_scheduler = self.cpu_schedulers[target_cpu as usize].lock();
+                    target_scheduler.rt_edf_queue.push_back(pid);
+                }
+                return;
+            }
+            
+            // Remove from CBS queue
+            if let Some(pos) = scheduler.rt_cbs_queue.iter().position(|&p| p == pid) {
+                scheduler.rt_cbs_queue.remove(pos);
+                
+                // Add to target CPU
+                if cpu_id != target_cpu as usize {
+                    drop(scheduler);
+                    let mut target_scheduler = self.cpu_schedulers[target_cpu as usize].lock();
+                    target_scheduler.rt_cbs_queue.push_back(pid);
+                }
+                return;
+            }
+        }
+    }
+    
+    /// Enforce RT core isolation by moving non-RT processes away from RT cores
+    pub fn enforce_rt_core_isolation(&mut self) {
+        for (cpu_id, cpu_scheduler) in self.cpu_schedulers.iter().enumerate() {
+            if self.is_rt_core(cpu_id as u8) {
+                let mut scheduler = cpu_scheduler.lock();
+                let mut non_rt_processes = Vec::new();
+                
+                // Find non-RT processes on RT cores
+                for priority_queue in &mut scheduler.ready_queues {
+                    while let Some(pid) = priority_queue.pop_front() {
+                        if let Some(process) = self.processes.get(pid as usize).and_then(|p| p.as_ref()) {
+                            if matches!(process.rt_params.class, RtClass::BestEffort) {
+                                non_rt_processes.push(pid);
+                            } else {
+                                priority_queue.push_back(pid); // Keep RT processes
+                            }
+                        }
+                    }
+                }
+                
+                drop(scheduler);
+                
+                // Migrate non-RT processes to non-RT cores
+                for pid in non_rt_processes {
+                    // Find a non-RT core with least load
+                    let mut target_cpu = 0;
+                    let mut min_load = u32::MAX;
+                    
+                    for (other_cpu_id, other_scheduler) in self.cpu_schedulers.iter().enumerate() {
+                        if !self.is_rt_core(other_cpu_id as u8) {
+                            let load = other_scheduler.lock().get_load();
+                            if load < min_load {
+                                min_load = load;
+                                target_cpu = other_cpu_id;
+                            }
+                        }
+                    }
+                    
+                    // Add to target CPU's ready queue
+                    if let Some(process) = self.processes.get(pid as usize).and_then(|p| p.as_ref()) {
+                        let priority = process.priority as usize;
+                        if priority < self.cpu_schedulers[target_cpu].lock().ready_queues.len() {
+                            self.cpu_schedulers[target_cpu].lock().ready_queues[priority].push_back(pid);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     pub fn unblock_process(&mut self, pid: u64) {
         // First, check if the process exists and is blocked, and get its priority
         let (should_unblock, priority) = if let Some(process) = self.processes.get_mut(pid as usize).and_then(|p| p.as_mut()) {
@@ -885,6 +1299,185 @@ impl SmpScheduler {
             cpu_scheduler.lock().rt_isolated
         } else {
             false
+        }
+    }
+
+    // NUMA-aware scheduling methods
+    pub fn set_numa_topology(&mut self, numa_nodes: &[NumaNode]) {
+        for (cpu_id, scheduler_mutex) in self.cpu_schedulers.iter().enumerate() {
+            let mut scheduler = scheduler_mutex.lock();
+            
+            // Find the NUMA node for this CPU
+            for numa_node in numa_nodes {
+                if (numa_node.cpu_mask & (1 << cpu_id)) != 0 {
+                    scheduler.set_numa_node(*numa_node);
+                    break;
+                }
+            }
+        }
+    }
+
+    pub fn numa_aware_load_balance(&mut self) {
+        // Group CPUs by NUMA node
+        let mut numa_groups: alloc::collections::BTreeMap<u8, Vec<usize>> = alloc::collections::BTreeMap::new();
+        
+        for (cpu_id, scheduler_mutex) in self.cpu_schedulers.iter().enumerate() {
+            let scheduler = scheduler_mutex.lock();
+            if let Some(numa_node) = scheduler.get_numa_node() {
+                numa_groups.entry(numa_node.id).or_insert_with(Vec::new).push(cpu_id);
+            }
+        }
+
+        // Balance load within each NUMA node first
+        for (_numa_id, cpu_list) in numa_groups.iter() {
+            self.balance_load_within_numa_node(cpu_list);
+        }
+
+        // Then balance across NUMA nodes if necessary
+        self.balance_load_across_numa_nodes(&numa_groups);
+    }
+
+    fn balance_load_within_numa_node(&mut self, cpu_list: &[usize]) {
+        if cpu_list.len() < 2 {
+            return;
+        }
+
+        // Find the most and least loaded CPUs within this NUMA node
+        let mut max_load = 0;
+        let mut min_load = u32::MAX;
+        let mut max_cpu = 0;
+        let mut min_cpu = 0;
+
+        for &cpu_id in cpu_list {
+            let load = self.cpu_schedulers[cpu_id].lock().get_load();
+            if load > max_load {
+                max_load = load;
+                max_cpu = cpu_id;
+            }
+            if load < min_load {
+                min_load = load;
+                min_cpu = cpu_id;
+            }
+        }
+
+        // Migrate processes if load imbalance is significant
+        if max_load > min_load + 2 {
+            self.migrate_process_between_cpus(max_cpu as u32, min_cpu as u32);
+        }
+    }
+
+    fn balance_load_across_numa_nodes(&mut self, numa_groups: &alloc::collections::BTreeMap<u8, Vec<usize>>) {
+        // Calculate average load per NUMA node
+        let mut numa_loads: Vec<(u8, u32)> = Vec::new();
+        
+        for (&numa_id, cpu_list) in numa_groups {
+            let total_load: u32 = cpu_list.iter()
+                .map(|&cpu_id| self.cpu_schedulers[cpu_id].lock().get_load())
+                .sum();
+            let avg_load = if cpu_list.is_empty() { 0 } else { total_load / cpu_list.len() as u32 };
+            numa_loads.push((numa_id, avg_load));
+        }
+
+        // Sort by load
+        numa_loads.sort_by_key(|&(_, load)| load);
+
+        // Migrate processes from high-load to low-load NUMA nodes if imbalance is severe
+        if numa_loads.len() >= 2 {
+            let (low_numa, low_load) = numa_loads[0];
+            let (high_numa, high_load) = numa_loads[numa_loads.len() - 1];
+            
+            if high_load > low_load + 4 {
+                // Find representative CPUs from each NUMA node
+                if let (Some(low_cpus), Some(high_cpus)) = (numa_groups.get(&low_numa), numa_groups.get(&high_numa)) {
+                    if let (Some(&low_cpu), Some(&high_cpu)) = (low_cpus.first(), high_cpus.first()) {
+                        self.migrate_process_between_cpus(high_cpu as u32, low_cpu as u32);
+                    }
+                }
+            }
+        }
+    }
+
+    fn migrate_process_between_cpus(&mut self, from_cpu: u32, to_cpu: u32) {
+        // Find a suitable process to migrate
+        let mut process_to_migrate: Option<u64> = None;
+        
+        {
+            let from_scheduler = self.cpu_schedulers[from_cpu as usize].lock();
+            
+            // Look for a non-RT process in the lowest priority queue
+            for priority in (0..4).rev() {
+                if let Some(&pid) = from_scheduler.ready_queues[priority].front() {
+                    // Check if process can run on target CPU
+                    if let Some(process) = self.processes.get(pid as usize).and_then(|p| p.as_ref()) {
+                        if process.cpu_affinity.can_run_on(to_cpu) {
+                            process_to_migrate = Some(pid);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Perform the migration
+        if let Some(pid) = process_to_migrate {
+            {
+                let mut from_scheduler = self.cpu_schedulers[from_cpu as usize].lock();
+                from_scheduler.remove_process(pid);
+            }
+            
+            if let Some(process) = self.processes.get(pid as usize).and_then(|p| p.as_ref()) {
+                let mut to_scheduler = self.cpu_schedulers[to_cpu as usize].lock();
+                to_scheduler.add_process(pid, process.priority);
+            }
+        }
+    }
+
+    // Priority inheritance across CPUs
+    pub fn inherit_priority_across_cpus(&mut self, pid: u64, from_pid: u64) {
+        // Find which CPUs these processes are on
+        let mut pid_cpu: Option<u32> = None;
+        
+        for (cpu_id, scheduler_mutex) in self.cpu_schedulers.iter().enumerate() {
+            let scheduler = scheduler_mutex.lock();
+            if scheduler.current_process == Some(pid) {
+                pid_cpu = Some(cpu_id as u32);
+                break;
+            }
+        }
+
+        // Apply priority inheritance
+        if let Some(cpu_id) = pid_cpu {
+            let mut scheduler = self.cpu_schedulers[cpu_id as usize].lock();
+            scheduler.inherit_priority(pid, from_pid, &mut self.processes);
+        }
+    }
+
+    pub fn restore_priority_across_cpus(&mut self, pid: u64) {
+        // Find which CPU this process is on
+        for (cpu_id, scheduler_mutex) in self.cpu_schedulers.iter().enumerate() {
+            let scheduler = scheduler_mutex.lock();
+            if scheduler.current_process == Some(pid) {
+                drop(scheduler);
+                let mut scheduler = self.cpu_schedulers[cpu_id].lock();
+                scheduler.restore_priority(pid, &mut self.processes);
+                break;
+            }
+        }
+    }
+
+    // CBS throttling across all CPUs
+    pub fn update_all_cbs_budgets(&mut self, current_time_us: u64) {
+        for scheduler_mutex in &self.cpu_schedulers {
+            let mut scheduler = scheduler_mutex.lock();
+            scheduler.replenish_cbs_budget(current_time_us, &mut self.processes);
+        }
+    }
+
+    pub fn get_numa_node_for_cpu(&self, cpu_id: u32) -> Option<NumaNode> {
+        if let Some(scheduler_mutex) = self.cpu_schedulers.get(cpu_id as usize) {
+            scheduler_mutex.lock().get_numa_node()
+        } else {
+            None
         }
     }
 }
@@ -1072,6 +1665,56 @@ pub fn spawn_kernel_thread(name: &str, entry: extern "C" fn() -> !) -> u64 {
     get_smp_scheduler().lock().add_process(proc)
 }
 
+/// Spawn a real-time kernel thread with specific RT parameters
+pub fn spawn_rt_kernel_thread(
+    name: &str, 
+    entry: extern "C" fn() -> !, 
+    rt_class: RtClass,
+    period_us: u64,
+    budget_us: u64,
+    cpu_affinity: Option<CpuAffinity>
+) -> u64 {
+    let stack_size: usize = 64 * 1024;
+    let mut stack = alloc::vec::Vec::<u8>::with_capacity(stack_size);
+    unsafe { stack.set_len(stack_size); }
+    let stack_ptr = stack.as_mut_ptr();
+    core::mem::forget(stack); // leak to keep alive; tracked by Process
+
+    let mut ctx = ProcessContext::default();
+    ctx.rip = entry as usize as u64;
+    ctx.rsp = (stack_ptr as u64) + stack_size as u64;
+
+    let mut proc = Process::kernel_process(alloc::string::String::from(name), VirtAddr::new(ctx.rip));
+    proc.context = ctx;
+    proc = proc.with_kernel_stack(stack_ptr, stack_size);
+    
+    // Set RT parameters
+    let current_time = crate::time::get_uptime_ms() * 1000; // Convert to microseconds
+    proc.rt_params = RtParams {
+        class: rt_class,
+        deadline_us: period_us,
+        period_us,
+        budget_us,
+        remaining_budget: budget_us,
+        next_deadline: current_time + period_us,
+        last_replenish: current_time,
+        cbs_params: None,
+        priority_inheritance: PriorityInheritanceState::None,
+    };
+    
+    // Set CPU affinity if specified
+    if let Some(affinity) = cpu_affinity {
+        proc.cpu_affinity = affinity;
+    }
+    
+    let pid = get_smp_scheduler().lock().add_process(proc);
+    
+    // Add to RT scheduler
+    get_smp_scheduler().lock().add_rt_process(pid, rt_class);
+    
+    pid
+}
+
 pub fn schedule() -> Option<u64> {
     let cpu_id = get_current_cpu_id();
     get_smp_scheduler().lock().schedule_on_cpu(cpu_id)
@@ -1121,7 +1764,7 @@ fn cleanup_process_resources(process_id: u32) {
     crate::raede::cleanup_process_raede(process_id);
     
     // Clean up address space if it exists
-    let mut scheduler = get_smp_scheduler().lock();
+    let scheduler = get_smp_scheduler().lock();
     if let Some(process) = scheduler.processes.get(process_id as usize).and_then(|p| p.as_ref()) {
         if let Some(address_space_id) = process.address_space_id {
             drop(scheduler); // Release lock before VMM operations
@@ -1169,6 +1812,106 @@ pub fn spawn_demo_thread() -> u64 {
     spawn_kernel_thread("demo", demo_kernel_thread)
 }
 
+// Input processing RT thread - handles input events with low latency
+extern "C" fn input_rt_thread() -> ! {
+    loop {
+        // Process input events from keyboard, mouse, touchpad
+        crate::input::process_input_events();
+        
+        // Yield to allow other RT tasks to run
+        yield_current();
+    }
+}
+
+// Audio processing RT thread - handles audio with strict timing
+extern "C" fn audio_rt_thread() -> ! {
+    loop {
+        // Process audio buffers and maintain low-latency audio pipeline
+        crate::sound::process_audio_buffers();
+        
+        // Yield to maintain timing constraints
+        yield_current();
+    }
+}
+
+// Compositor RT thread - handles frame rendering with vsync timing
+extern "C" fn compositor_rt_thread() -> ! {
+    loop {
+        // Render frames and handle compositor operations
+        crate::graphics::process_compositor_frame();
+        
+        // Yield to maintain frame timing
+        yield_current();
+    }
+}
+
+/// Initialize real-time threads for input, audio, and compositor
+pub fn init_rt_threads() -> Result<(), &'static str> {
+    // Get CPU count for RT core isolation
+    let num_cpus = get_cpu_count();
+    
+    if num_cpus < 4 {
+        return Err("RT core isolation requires at least 4 CPU cores (cores 2-3 for RT)");
+    }
+    
+    let mut scheduler = get_smp_scheduler().lock();
+    
+    // Enforce RT core isolation before creating RT threads
+    scheduler.enforce_rt_core_isolation();
+    
+    // Input RT thread - EDF with 1ms period, 200μs budget on core 2
+    let input_affinity = CpuAffinity::single_cpu(2);
+    let input_pid = spawn_rt_kernel_thread(
+        "input_rt",
+        input_rt_thread,
+        RtClass::Edf,
+        1000,  // 1ms period
+        200,   // 200μs budget
+        Some(input_affinity)
+    );
+    
+    // Migrate input thread to its dedicated core
+    scheduler.migrate_rt_process(input_pid, 2);
+    
+    // Audio RT thread - CBS with 2.67ms period, 500μs budget on core 3
+    let audio_affinity = CpuAffinity::single_cpu(3);
+    let audio_pid = spawn_rt_kernel_thread(
+        "audio_rt",
+        audio_rt_thread,
+        RtClass::Cbs,
+        2670,  // ~2.67ms period (128 samples at 48kHz)
+        500,   // 500μs budget
+        Some(audio_affinity)
+    );
+    
+    // Migrate audio thread to its dedicated core
+    scheduler.migrate_rt_process(audio_pid, 3);
+    
+    // Compositor RT thread - CBS with 8.33ms period, 2ms budget on core 3 (shared with audio)
+    let compositor_affinity = CpuAffinity::single_cpu(3);
+    let compositor_pid = spawn_rt_kernel_thread(
+        "compositor_rt",
+        compositor_rt_thread,
+        RtClass::Cbs,
+        8333,  // 8.33ms period (120Hz)
+        2000,  // 2ms budget
+        Some(compositor_affinity)
+    );
+    
+    // Migrate compositor thread to core 3 (shared with audio via CBS)
+    scheduler.migrate_rt_process(compositor_pid, 3);
+    
+    drop(scheduler);
+    
+    crate::serial_println!("[RT] Initialized RT threads with core isolation:");
+    crate::serial_println!("[RT] Input (PID {}): EDF 1ms/200μs on CPU 2", input_pid);
+    crate::serial_println!("[RT] Audio (PID {}): CBS 2.67ms/500μs on CPU 3", audio_pid);
+    crate::serial_println!("[RT] Compositor (PID {}): CBS 8.33ms/2ms on CPU 3", compositor_pid);
+    crate::serial_println!("[RT] Cores 2-3 isolated for real-time processing");
+    
+    Ok(())
+}
+
 pub fn set_gaming_mode(enabled: bool) {
     get_smp_scheduler().lock().set_gaming_mode(enabled);
 }
@@ -1183,6 +1926,25 @@ pub fn get_current_process_id() -> u64 {
     let cpu_id = get_current_cpu_id();
     let scheduler = get_smp_scheduler().lock();
     scheduler.get_current_process_id(cpu_id).unwrap_or(0)
+}
+
+pub fn get_current_process_parent_id() -> Option<u64> {
+    let cpu_id = get_current_cpu_id();
+    let scheduler = get_smp_scheduler().lock();
+    scheduler.get_current_process(cpu_id).and_then(|p| p.parent_pid)
+}
+
+/// Check if a process is alive (exists and not in a terminated state)
+pub fn is_process_alive(process_id: u64) -> bool {
+    let scheduler = get_smp_scheduler().lock();
+    if let Some(Some(process)) = scheduler.processes.get(process_id as usize) {
+        match process.state {
+            ProcessState::Running | ProcessState::Ready | ProcessState::Blocked => true,
+            ProcessState::Terminated => false,
+        }
+    } else {
+        false
+    }
 }
 
 
@@ -1284,18 +2046,14 @@ pub fn context_switch(old_pid: Option<u64>, new_pid: u64) {
                 // Re-get the process reference after re-acquiring lock
                 if let Some(new_process) = scheduler.processes.get_mut(new_pid as usize).and_then(|p| p.as_mut()) {
                     // Context will be loaded by the assembly routine
-                    unsafe {
-                        switch_context(old_ctx_ptr, &new_process.context as *const ProcessContext);
-                    }
+                    switch_context(old_ctx_ptr, &new_process.context as *const ProcessContext);
                 }
                 return;
             }
         }
         
         // No address space switch needed, just switch context
-        unsafe {
-            switch_context(old_ctx_ptr, &new_process.context as *const ProcessContext);
-        }
+        switch_context(old_ctx_ptr, &new_process.context as *const ProcessContext);
     }
 }
 
@@ -1344,6 +2102,13 @@ pub fn schedule_tick() {
             context_switch(current, next_pid);
         }
     }
+}
+
+/// Get the next scheduler deadline in microseconds for tickless operation
+pub fn get_next_scheduler_deadline_us() -> u64 {
+    // Use SMP scheduler's optimized deadline calculation
+    let smp_scheduler = get_smp_scheduler().lock();
+    smp_scheduler.get_earliest_deadline_us()
 }
 
 // Process management functions for syscalls

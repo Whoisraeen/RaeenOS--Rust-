@@ -30,7 +30,7 @@ pub fn init() {
 }
 
 // Play a tone using the PC speaker
-pub fn play_tone(frequency: u32, duration_ms: u32) -> Result<(), ()> {
+pub fn play_tone(frequency: u32, _duration_ms: u32) -> Result<(), ()> {
     if frequency == 0 {
         return stop_sound();
     }
@@ -123,4 +123,26 @@ pub fn play_melody(frequencies: &[u32], durations: &[u32]) -> Result<(), ()> {
 pub fn get_status() -> (bool, u32) {
     let sound = SOUND_SYSTEM.lock();
     (sound.enabled, sound.current_frequency)
+}
+
+/// Process audio buffers for real-time audio thread
+/// This function is called by the audio RT thread to handle low-latency audio processing
+pub fn process_audio_buffers() {
+    // For now, this is a placeholder for real audio buffer processing
+    // In a full implementation, this would:
+    // 1. Check for pending audio data in input/output buffers
+    // 2. Process audio effects and mixing
+    // 3. Handle audio device I/O
+    // 4. Maintain audio timing and synchronization
+    
+    // Basic audio system maintenance
+    let sound = SOUND_SYSTEM.lock();
+    if sound.enabled && sound.current_frequency > 0 {
+        // Audio is active - perform minimal processing
+        // This could include checking for buffer underruns,
+        // updating audio device state, etc.
+    }
+    
+    // For now, just yield to maintain RT thread timing
+    // In a real implementation, this would process actual audio buffers
 }

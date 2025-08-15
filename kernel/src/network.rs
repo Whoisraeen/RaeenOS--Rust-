@@ -55,7 +55,7 @@ const IPPROTO_UDP: u32 = 17;
 
 // Socket states
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SocketState {
+pub enum SocketState {
     Created,
     Bound,
     Listening,
@@ -65,8 +65,8 @@ enum SocketState {
 
 // Socket address
 #[derive(Debug, Clone)]
-struct SocketAddr {
-    ip: [u8; 4], // IPv4 for simplicity
+pub struct SocketAddr {
+    _ip: [u8; 4], // IPv4 for simplicity
     port: u16,
 }
 
@@ -79,7 +79,7 @@ impl SocketAddr {
         let ip = [data[0], data[1], data[2], data[3]];
         let port = u16::from_be_bytes([data[4], data[5]]);
         
-        Ok(SocketAddr { ip, port })
+        Ok(SocketAddr { _ip: ip, port })
     }
 }
 
@@ -339,7 +339,7 @@ pub fn connect_socket(socket_fd: u32, addr: &[u8]) -> NetworkResult<()> {
     Ok(())
 }
 
-pub fn send_data(socket_fd: u32, data: &[u8], flags: u32) -> NetworkResult<usize> {
+pub fn send_data(socket_fd: u32, data: &[u8], _flags: u32) -> NetworkResult<usize> {
     let mut network = NETWORK_SYSTEM.lock();
     let current_pid = crate::process::get_current_process_id();
     
@@ -379,7 +379,7 @@ pub fn send_data(socket_fd: u32, data: &[u8], flags: u32) -> NetworkResult<usize
     Ok(data.len())
 }
 
-pub fn receive_data(socket_fd: u32, length: usize, flags: u32) -> NetworkResult<Vec<u8>> {
+pub fn receive_data(socket_fd: u32, length: usize, _flags: u32) -> NetworkResult<Vec<u8>> {
     let mut network = NETWORK_SYSTEM.lock();
     let current_pid = crate::process::get_current_process_id();
     
@@ -465,14 +465,14 @@ pub fn get_socket_info(socket_fd: u32) -> NetworkResult<(SocketState, Option<Soc
 
 // Clean up network resources for a process
 pub fn cleanup_process_network(process_id: u32) {
-    let mut network = NETWORK_SYSTEM.lock();
-    
-    // Close all sockets owned by the process
-    let sockets_to_close: Vec<u32> = network.sockets
-        .iter()
-        .filter(|(_, socket)| socket.process_id == process_id)
-        .map(|(&fd, _)| fd)
-        .collect();
+    let sockets_to_close: Vec<u32> = {
+        let network = NETWORK_SYSTEM.lock();
+        network.sockets
+            .iter()
+            .filter(|(_, socket)| socket.process_id == process_id)
+            .map(|(&fd, _)| fd)
+            .collect()
+    };
     
     for socket_fd in sockets_to_close {
         let _ = close_socket(socket_fd);

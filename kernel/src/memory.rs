@@ -3,6 +3,18 @@ use x86_64::structures::paging::{OffsetPageTable, PageTable, PhysFrame, FrameAll
 use spin::Mutex;
 use core::sync::atomic::{AtomicU64, Ordering};
 
+/// Memory region types for frame allocation
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryType {
+    Usable,
+    Reserved,
+    AcpiReclaimable,
+    AcpiNvs,
+    Bootloader,
+    Kernel,
+    FrameBuffer,
+}
+
 pub unsafe fn init(physical_memory_offset: VirtAddr) -> OffsetPageTable<'static> {
     let level_4_table = active_level_4_table(physical_memory_offset);
     OffsetPageTable::new(level_4_table, physical_memory_offset)
@@ -120,7 +132,7 @@ pub fn set_program_break(addr: VirtAddr) -> Result<VirtAddr, ()> {
     // Validate the new break address
     if addr < current_break {
         // Shrinking heap - unmap pages
-        let pages_to_unmap = (current_break.as_u64() - addr.as_u64()) / 4096;
+        let _pages_to_unmap = (current_break.as_u64() - addr.as_u64()) / 4096;
         
         // Get current process for permission checking
         let current_pid = crate::process::get_current_process_info().map(|(pid, _, _)| pid).unwrap_or(0);

@@ -1,29 +1,27 @@
 //! Advanced Programmable Interrupt Controller (APIC) support for RaeenOS
 //! Implements Local APIC, x2APIC, and I/O APIC functionality for SMP systems
 
-use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use lazy_static::lazy_static;
 use spin::Mutex;
 use x86_64::structures::idt::InterruptStackFrame;
 use x86_64::instructions::port::Port;
 use x86_64::{PhysAddr, VirtAddr};
-use x86_64::structures::paging::{Mapper, Page, PageTableFlags, PhysFrame, Size4KiB};
+use x86_64::structures::paging::{Mapper, PhysFrame, Size4KiB};
 use alloc::vec::Vec;
 
-use crate::arch::{has_cpu_feature, detect_cpu_info, CpuFeature};
-use crate::memory::with_mapper;
+use crate::arch::{has_cpu_feature, detect_cpu_info, CpuFeature, tsc};
 
 /// APIC register offsets
 const APIC_ID: u32 = 0x020;
 const APIC_VERSION: u32 = 0x030;
-const APIC_TPR: u32 = 0x080;
-const APIC_APR: u32 = 0x090;
-const APIC_PPR: u32 = 0x0A0;
+const _APIC_TPR: u32 = 0x080;
+const _APIC_APR: u32 = 0x090;
+const _APIC_PPR: u32 = 0x0A0;
 const APIC_EOI: u32 = 0x0B0;
-const APIC_RRD: u32 = 0x0C0;
-const APIC_LDR: u32 = 0x0D0;
-const APIC_DFR: u32 = 0x0E0;
+const _APIC_RRD: u32 = 0x0C0;
+const _APIC_LDR: u32 = 0x0D0;
+const _APIC_DFR: u32 = 0x0E0;
 const APIC_SPURIOUS: u32 = 0x0F0;
 const APIC_ESR: u32 = 0x280;
 const APIC_ICRL: u32 = 0x300;
@@ -40,23 +38,23 @@ const APIC_TIMER_DCR: u32 = 0x3E0;
 
 /// x2APIC MSR addresses
 const X2APIC_APICID: u32 = 0x802;
-const X2APIC_VERSION: u32 = 0x803;
-const X2APIC_TPR: u32 = 0x808;
-const X2APIC_PPR: u32 = 0x80A;
-const X2APIC_EOI: u32 = 0x80B;
-const X2APIC_LDR: u32 = 0x80D;
-const X2APIC_SPURIOUS: u32 = 0x80F;
-const X2APIC_ESR: u32 = 0x828;
+const _X2APIC_VERSION: u32 = 0x803;
+const _X2APIC_TPR: u32 = 0x808;
+const _X2APIC_PPR: u32 = 0x80A;
+const _X2APIC_EOI: u32 = 0x80B;
+const _X2APIC_LDR: u32 = 0x80D;
+const _X2APIC_SPURIOUS: u32 = 0x80F;
+const _X2APIC_ESR: u32 = 0x828;
 const X2APIC_ICR: u32 = 0x830;
-const X2APIC_LVT_TIMER: u32 = 0x832;
-const X2APIC_LVT_THERMAL: u32 = 0x833;
-const X2APIC_LVT_PERF: u32 = 0x834;
-const X2APIC_LVT_LINT0: u32 = 0x835;
-const X2APIC_LVT_LINT1: u32 = 0x836;
-const X2APIC_LVT_ERROR: u32 = 0x837;
-const X2APIC_TIMER_ICR: u32 = 0x838;
-const X2APIC_TIMER_CCR: u32 = 0x839;
-const X2APIC_TIMER_DCR: u32 = 0x83E;
+const _X2APIC_LVT_TIMER: u32 = 0x832;
+const _X2APIC_LVT_THERMAL: u32 = 0x833;
+const _X2APIC_LVT_PERF: u32 = 0x834;
+const _X2APIC_LVT_LINT0: u32 = 0x835;
+const _X2APIC_LVT_LINT1: u32 = 0x836;
+const _X2APIC_LVT_ERROR: u32 = 0x837;
+const _X2APIC_TIMER_ICR: u32 = 0x838;
+const _X2APIC_TIMER_CCR: u32 = 0x839;
+const _X2APIC_TIMER_DCR: u32 = 0x83E;
 
 /// APIC timer modes
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -228,10 +226,18 @@ impl LocalApic {
     
     /// Initialize APIC timer
     fn init_timer(&mut self) -> Result<(), &'static str> {
-        if self.tsc_deadline_supported {
+        if self.tsc_deadline_supported && tsc::is_invariant_available() {
             // Use TSC-deadline mode for high precision
             self.write_register(APIC_LVT_TIMER, 0x20 | (2 << 17)); // Vector 0x20, TSC-deadline mode
-            self.calibrate_tsc_frequency();
+            
+            // Use TSC frequency from arch module
+            let tsc_freq = tsc::get_frequency();
+            if tsc_freq > 0 {
+                self.timer_frequency.store(tsc_freq, Ordering::SeqCst);
+                crate::serial::_print(format_args!("[APIC] TSC-deadline timer initialized with frequency: {} Hz\n", tsc_freq));
+            } else {
+                return Err("TSC frequency not available");
+            }
         } else {
             // Use periodic mode
             self.write_register(APIC_TIMER_DCR, 0x3); // Divide by 16
@@ -242,23 +248,7 @@ impl LocalApic {
         Ok(())
     }
     
-    /// Calibrate TSC frequency for TSC-deadline timer
-    fn calibrate_tsc_frequency(&mut self) {
-        // Use PIT to calibrate TSC frequency
-        let start_tsc = unsafe {
-            core::arch::x86_64::_rdtsc()
-        };
-        
-        // Wait approximately 10ms using PIT
-        self.pit_delay_ms(10);
-        
-        let end_tsc = unsafe {
-            core::arch::x86_64::_rdtsc()
-        };
-        
-        let tsc_freq = (end_tsc - start_tsc) * 100; // 10ms -> 1s
-        self.timer_frequency.store(tsc_freq, Ordering::SeqCst);
-    }
+
     
     /// Calibrate APIC timer frequency
     fn calibrate_timer_frequency(&mut self) {
@@ -355,15 +345,9 @@ impl LocalApic {
     
     /// Set timer for one-shot mode
     pub fn set_timer_oneshot(&self, microseconds: u64) {
-        if self.tsc_deadline_supported {
-            let tsc_freq = self.timer_frequency.load(Ordering::SeqCst);
-            let tsc_deadline = unsafe { core::arch::x86_64::_rdtsc() } + 
-                (tsc_freq * microseconds) / 1_000_000;
-            
-            unsafe {
-                use x86_64::registers::model_specific::Msr;
-                Msr::new(0x6E0).write(tsc_deadline); // IA32_TSC_DEADLINE
-            }
+        if self.tsc_deadline_supported && tsc::is_invariant_available() {
+            // Use arch module TSC deadline timer
+            tsc::deadline::set_deadline_us(microseconds);
         } else {
             let freq = self.timer_frequency.load(Ordering::SeqCst);
             let count = (freq * microseconds) / 1_000_000;
@@ -375,17 +359,18 @@ impl LocalApic {
     
     /// Set timer for periodic mode
     pub fn set_timer_periodic(&self, frequency_hz: u32) {
-        if self.tsc_deadline_supported {
+        if self.tsc_deadline_supported && tsc::is_invariant_available() {
             // TSC-deadline doesn't support periodic mode directly
-            // We'll need to reprogram it in the interrupt handler
-            return;
+            // The time module will handle reprogramming in the interrupt handler
+            let interval_us = 1_000_000 / frequency_hz as u64;
+            tsc::deadline::set_deadline_us(interval_us);
+        } else {
+            let apic_freq = self.timer_frequency.load(Ordering::SeqCst);
+            let count = apic_freq / frequency_hz as u64;
+            
+            self.write_register(APIC_LVT_TIMER, 0x20 | (1 << 17)); // Vector 0x20, periodic
+            self.write_register(APIC_TIMER_ICR, count as u32);
         }
-        
-        let apic_freq = self.timer_frequency.load(Ordering::SeqCst);
-        let count = apic_freq / frequency_hz as u64;
-        
-        self.write_register(APIC_LVT_TIMER, 0x20 | (1 << 17)); // Vector 0x20, periodic
-        self.write_register(APIC_TIMER_ICR, count as u32);
     }
     
     /// Send Inter-Processor Interrupt
@@ -554,7 +539,7 @@ impl IoApic {
 pub struct SmpController {
     local_apic: LocalApic,
     io_apics: Vec<IoApic>,
-    cpu_count: AtomicU32,
+    _cpu_count: AtomicU32,
     online_cpus: AtomicU32,
 }
 
@@ -564,7 +549,7 @@ impl SmpController {
         Self {
             local_apic: LocalApic::new(),
             io_apics: Vec::new(),
-            cpu_count: AtomicU32::new(1), // BSP
+            _cpu_count: AtomicU32::new(1), // BSP
             online_cpus: AtomicU32::new(1),
         }
     }
@@ -670,7 +655,7 @@ impl SmpController {
     }
 }
 
-/// Global SMP controller instance
+// Global SMP controller instance
 lazy_static! {
     static ref SMP_CONTROLLER: Mutex<SmpController> = Mutex::new(SmpController::new());
 }

@@ -1,5 +1,6 @@
 use spin::Mutex;
 use uart_16550::SerialPort;
+use core::fmt::Write;
 
 pub static SERIAL1: Mutex<SerialPort> = Mutex::new(unsafe { SerialPort::new(0x3F8) });
 
@@ -11,8 +12,10 @@ pub fn init() {
 #[macro_export]
 macro_rules! serial_print {
     ($($arg:tt)*) => {
-        use core::fmt::Write;
-        let _ = write!($crate::serial::SERIAL1.lock(), $($arg)*);
+        {
+            use core::fmt::Write;
+            let _ = write!($crate::serial::SERIAL1.lock(), $($arg)*);
+        }
     };
 }
 
@@ -25,7 +28,6 @@ macro_rules! serial_println {
 }
 
 pub fn _print(args: core::fmt::Arguments) {
-    use core::fmt::Write;
     let _ = SERIAL1.lock().write_fmt(args);
 }
 

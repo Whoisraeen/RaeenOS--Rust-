@@ -68,8 +68,8 @@ struct SecurityContext {
     sandbox_level: SandboxLevel,
     allowed_paths: Vec<String>,
     denied_paths: Vec<String>,
-    network_allowed: bool,
-    max_memory: Option<usize>,
+    _network_allowed: bool,
+    _max_memory: Option<usize>,
 }
 
 impl Default for SecurityContext {
@@ -79,8 +79,8 @@ impl Default for SecurityContext {
             sandbox_level: SandboxLevel::Medium,
             allowed_paths: Vec::new(),
             denied_paths: Vec::new(),
-            network_allowed: false,
-            max_memory: Some(64 * 1024 * 1024), // 64MB default limit
+            _network_allowed: false,
+            _max_memory: Some(64 * 1024 * 1024), // 64MB default limit
         }
     }
 }
@@ -88,13 +88,13 @@ impl Default for SecurityContext {
 // Security system state
 struct SecuritySystem {
     process_contexts: BTreeMap<u32, SecurityContext>,
-    global_policies: BTreeMap<String, bool>,
+    _global_policies: BTreeMap<String, bool>,
 }
 
 lazy_static! {
     static ref SECURITY_SYSTEM: Mutex<SecuritySystem> = Mutex::new(SecuritySystem {
         process_contexts: BTreeMap::new(),
-        global_policies: BTreeMap::new(),
+        _global_policies: BTreeMap::new(),
     });
 }
 
@@ -120,8 +120,8 @@ pub fn init_process_security(process_id: u32, parent_id: Option<u32>) -> Result<
             sandbox_level: SandboxLevel::None,
             allowed_paths: Vec::new(),
             denied_paths: Vec::new(),
-            network_allowed: true,
-            max_memory: None,
+            _network_allowed: true,
+            _max_memory: None,
         }
     };
     

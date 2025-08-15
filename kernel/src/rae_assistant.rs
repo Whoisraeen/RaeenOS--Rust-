@@ -30,8 +30,8 @@ pub enum ResponseType {
 // Assistant context
 #[derive(Debug, Clone)]
 struct AssistantContext {
-    session_id: u32,
-    capabilities: Vec<AssistantCapability>,
+    _session_id: u32,
+    _capabilities: Vec<AssistantCapability>,
     conversation_history: Vec<(String, String)>, // (prompt, response)
     process_id: u32,
 }
@@ -39,8 +39,8 @@ struct AssistantContext {
 impl AssistantContext {
     fn new(session_id: u32, process_id: u32) -> Self {
         Self {
-            session_id,
-            capabilities: vec![
+            _session_id: session_id,
+            _capabilities: vec![
                 AssistantCapability::TextGeneration,
                 AssistantCapability::ContentAnalysis,
                 AssistantCapability::SystemHelp,

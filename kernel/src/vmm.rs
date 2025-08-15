@@ -53,6 +53,15 @@ impl VmPermissions {
     
     pub fn contains(self, other: Self) -> bool { (self.0 & other.0) == other.0 }
     
+    /// Validates W^X policy: writable pages cannot be executable
+    pub fn validate_wx_policy(self) -> Result<(), VmError> {
+        if self.writable() && self.executable() {
+            Err(VmError::PermissionDenied)
+        } else {
+            Ok(())
+        }
+    }
+    
     pub fn to_page_table_flags(self) -> PageTableFlags {
         let mut flags = PageTableFlags::PRESENT;
         
@@ -195,7 +204,7 @@ impl AddressSpace {
         // Get current kernel PML4 to copy kernel mappings
         let (current_pml4_frame, _) = Cr3::read();
         
-        memory::with_mapper(|mapper| {
+        memory::with_mapper(|_mapper| {
             // Map the new PML4 temporarily to copy kernel entries
             let pml4_virt = memory::phys_to_virt(self.pml4_frame.start_address());
             let new_pml4 = unsafe { &mut *(pml4_virt.as_mut_ptr::<PageTable>()) };
@@ -246,6 +255,9 @@ impl AddressSpace {
     }
     
     pub fn allocate_area(&mut self, size: u64, area_type: VmAreaType, permissions: VmPermissions) -> Result<VirtAddr, VmError> {
+        // Enforce W^X policy
+        permissions.validate_wx_policy()?;
+        
         let aligned_size = (size + 0xFFF) & !0xFFF; // Align to 4KB
         
         let start_addr = match area_type {
@@ -384,7 +396,10 @@ impl VirtualMemoryManager {
     
     // Update memory protection flags and flush TLB
     pub fn protect_memory(&mut self, as_id: u64, virt_addr: VirtAddr, size: usize, permissions: VmPermissions) -> Result<(), VmError> {
-        let address_space = self.get_address_space_mut(as_id)
+        // Enforce W^X policy
+        permissions.validate_wx_policy()?;
+        
+        let _address_space = self.get_address_space_mut(as_id)
             .ok_or(VmError::InvalidAddressSpace)?;
         
         let flags = permissions.to_page_table_flags();
@@ -400,7 +415,7 @@ impl VirtualMemoryManager {
                         flush.ignore(); // We'll do a batch TLB flush later
                         
                         // Remap with new flags
-                        if let Some(mut frame_alloc) = memory::FRAME_ALLOC.lock().as_mut() {
+                        if let Some(frame_alloc) = memory::FRAME_ALLOC.lock().as_mut() {
                             if let Ok(mapping) = unsafe { mapper.map_to(page, frame, flags, &mut *frame_alloc) } {
                                 mapping.ignore(); // We'll do a batch TLB flush later
                             }
@@ -530,6 +545,9 @@ impl VirtualMemoryManager {
     }
     
     fn allocate_page_on_demand(&mut self, _as_id: u64, virt_addr: VirtAddr, permissions: VmPermissions) -> Result<(), VmError> {
+        // Enforce W^X policy
+        permissions.validate_wx_policy()?;
+        
         let flags = permissions.to_page_table_flags();
         memory::with_mapper(|mapper| {
             let frame = memory::allocate_frame().ok_or(VmError::OutOfMemory)?;
@@ -785,7 +803,7 @@ pub fn get_address_space_info(as_id: u64) -> Option<(u64, Vec<(VirtAddr, VirtAdd
     Some((as_id, areas))
 }
 
-pub fn protect_memory(as_id: u64, start: VirtAddr, size: u64, permissions: VmPermissions) -> VmResult<()> {
+pub fn protect_memory(as_id: u64, start: VirtAddr, _size: u64, permissions: VmPermissions) -> VmResult<()> {
     let mut vmm = VMM.write();
     let address_space = vmm.get_address_space_mut(as_id)
         .ok_or(VmError::InvalidAddressSpace)?;
@@ -807,7 +825,7 @@ pub fn protect_memory(as_id: u64, start: VirtAddr, size: u64, permissions: VmPer
                         flush.ignore(); // We'll do a batch TLB flush later
                         
                         // Remap with new flags
-                        if let Some(mut frame_alloc) = memory::FRAME_ALLOC.lock().as_mut() {
+                        if let Some(frame_alloc) = memory::FRAME_ALLOC.lock().as_mut() {
                             if let Ok(mapping) = unsafe { mapper.map_to(page, frame, flags, &mut *frame_alloc) } {
                                 mapping.ignore(); // We'll do a batch TLB flush later
                             }
@@ -858,7 +876,7 @@ pub fn protect_memory_api(as_id: u64, virt_addr: VirtAddr, size: usize, permissi
 // Gaming mode optimizations
 pub fn enable_gaming_mode(as_id: u64) -> VmResult<()> {
     let mut vmm = VMM.write();
-    let address_space = vmm.get_address_space_mut(as_id)
+    let _address_space = vmm.get_address_space_mut(as_id)
         .ok_or(VmError::InvalidAddressSpace)?;
     
     // Pre-allocate common memory areas to reduce page faults
@@ -899,7 +917,7 @@ pub fn defragment_memory(as_id: u64) -> VmResult<()> {
             
             for i in 0..page_count {
                 let old_page_addr = old_page + i;
-                let new_page_addr = new_page + i;
+                let _new_page_addr = new_page + i;
                 
                 if let Ok(_frame) = mapper.translate_page(old_page_addr) {
                     let _ = mapper.unmap(old_page_addr);
@@ -977,7 +995,7 @@ pub fn decompress_pages(as_id: u64) -> VmResult<()> {
                             let flags = area.1.permissions.to_page_table_flags();
                             
                             // Map the new frame with appropriate flags
-                            if let Some(mut frame_alloc) = memory::FRAME_ALLOC.lock().as_mut() {
+                            if let Some(frame_alloc) = memory::FRAME_ALLOC.lock().as_mut() {
                                 if let Ok(mapping) = unsafe { mapper.map_to(page, frame, flags, &mut *frame_alloc) } {
                                     mapping.ignore(); // Batch TLB flush later
                                     
