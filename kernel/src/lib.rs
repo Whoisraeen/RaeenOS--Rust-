@@ -39,6 +39,8 @@ pub mod raekit;
 pub mod slo;
 pub mod slo_tests;
 pub mod microkernel;
+pub mod secure_boot;
+pub mod observability;
 
 extern crate alloc;
 
@@ -56,6 +58,21 @@ pub fn init(boot_info: &'static bootloader::BootInfo) {
     // Initialize per-CPU data structures
     if let Err(e) = percpu::init() {
         crate::serial::_print(format_args!("[PerCPU] Failed to initialize: {}\n", e));
+    }
+    
+    // Initialize CPU security features (SMEP/SMAP/UMIP)
+    if let Err(e) = arch::init_security_features() {
+        crate::serial::_print(format_args!("[Security] Warning: Failed to initialize security features: {}\n", e));
+    }
+    
+    // Initialize KASLR (Kernel Address Space Layout Randomization)
+    if let Err(e) = memory::init_kaslr() {
+        crate::serial::_print(format_args!("[Security] Warning: Failed to initialize KASLR: {}\n", e));
+    }
+    
+    // Initialize secure boot and measured boot
+    if let Err(e) = secure_boot::init() {
+        crate::serial::_print(format_args!("[Security] Warning: Failed to initialize secure boot: {}\n", e));
     }
     
     // Initialize APIC and PCI subsystems

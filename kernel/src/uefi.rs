@@ -11,9 +11,11 @@ use core::slice;
 const EFI_SYSTEM_TABLE_SIGNATURE: u64 = 0x5453595320494645; // "EFI SYST"
 
 /// UEFI Boot Services signature
+#[allow(dead_code)]
 const EFI_BOOT_SERVICES_SIGNATURE: u64 = 0x56524553544f4f42; // "BOOTSERV"
 
 /// UEFI Runtime Services signature
+#[allow(dead_code)]
 const EFI_RUNTIME_SERVICES_SIGNATURE: u64 = 0x56524553544e5552; // "RUNTSERV"
 
 /// EFI Status codes
@@ -540,7 +542,7 @@ pub struct EfiTimeCapabilities {
 }
 
 /// UEFI Boot Information
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct UefiBootInfo {
     pub system_table: *const EfiSystemTable,
     pub memory_map: Vec<EfiMemoryDescriptor>,
@@ -568,6 +570,12 @@ pub struct UefiManager {
     runtime_services: Option<*const EfiRuntimeServices>,
     gop: Option<*const GraphicsOutputProtocol>,
 }
+
+// SAFETY: UefiManager contains pointers to UEFI runtime services which are designed
+// to be accessed from any CPU core. The UEFI specification guarantees thread safety
+// for runtime services.
+unsafe impl Send for UefiManager {}
+unsafe impl Sync for UefiManager {}
 
 impl UefiManager {
     /// Create a new UEFI manager

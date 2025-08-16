@@ -953,3 +953,159 @@ pub mod tsc {
     }
 }
 
+/// Control Register 4 (CR4) management for security features
+pub mod cr4 {
+    /// CR4 bit definitions
+    pub const CR4_VME: u64 = 1 << 0;        // Virtual-8086 Mode Extensions
+    pub const CR4_PVI: u64 = 1 << 1;        // Protected-Mode Virtual Interrupts
+    pub const CR4_TSD: u64 = 1 << 2;        // Time Stamp Disable
+    pub const CR4_DE: u64 = 1 << 3;         // Debugging Extensions
+    pub const CR4_PSE: u64 = 1 << 4;        // Page Size Extensions
+    pub const CR4_PAE: u64 = 1 << 5;        // Physical Address Extension
+    pub const CR4_MCE: u64 = 1 << 6;        // Machine-Check Enable
+    pub const CR4_PGE: u64 = 1 << 7;        // Page Global Enable
+    pub const CR4_PCE: u64 = 1 << 8;        // Performance-Monitoring Counter Enable
+    pub const CR4_OSFXSR: u64 = 1 << 9;     // OS Support for FXSAVE/FXRSTOR
+    pub const CR4_OSXMMEXCPT: u64 = 1 << 10; // OS Support for Unmasked SIMD Exceptions
+    pub const CR4_UMIP: u64 = 1 << 11;      // User-Mode Instruction Prevention
+    pub const CR4_LA57: u64 = 1 << 12;      // 57-bit Linear Addresses
+    pub const CR4_VMXE: u64 = 1 << 13;      // VMX Enable
+    pub const CR4_SMXE: u64 = 1 << 14;      // SMX Enable
+    pub const CR4_FSGSBASE: u64 = 1 << 16;  // FSGSBASE Enable
+    pub const CR4_PCIDE: u64 = 1 << 17;     // PCID Enable
+    pub const CR4_OSXSAVE: u64 = 1 << 18;   // XSAVE and Processor Extended States Enable
+    pub const CR4_SMEP: u64 = 1 << 20;      // Supervisor Mode Execution Prevention
+    pub const CR4_SMAP: u64 = 1 << 21;      // Supervisor Mode Access Prevention
+    pub const CR4_PKE: u64 = 1 << 22;       // Protection Key Enable
+    pub const CR4_CET: u64 = 1 << 23;       // Control-flow Enforcement Technology
+    pub const CR4_PKS: u64 = 1 << 24;       // Protection Key for Supervisor
+    
+    /// Read CR4 register
+    #[inline]
+    pub fn read() -> u64 {
+        let cr4: u64;
+        unsafe {
+            core::arch::asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack));
+        }
+        cr4
+    }
+    
+    /// Write CR4 register
+    #[inline]
+    pub unsafe fn write(cr4: u64) {
+        core::arch::asm!("mov cr4, {}", in(reg) cr4, options(nomem, nostack));
+    }
+    
+    /// Set specific bits in CR4
+    #[inline]
+    pub unsafe fn set_bits(bits: u64) {
+        let current = read();
+        write(current | bits);
+    }
+    
+    /// Clear specific bits in CR4
+    #[inline]
+    pub unsafe fn clear_bits(bits: u64) {
+        let current = read();
+        write(current & !bits);
+    }
+    
+    /// Check if specific bits are set in CR4
+    #[inline]
+    pub fn has_bits(bits: u64) -> bool {
+        (read() & bits) == bits
+    }
+    
+    /// Enable SMEP (Supervisor Mode Execution Prevention)
+    pub fn enable_smep() -> Result<(), &'static str> {
+        if !super::has_cpu_feature(super::CpuFeature::Smep) {
+            return Err("SMEP not supported by CPU");
+        }
+        
+        unsafe {
+            set_bits(CR4_SMEP);
+        }
+        
+        crate::serial::_print(format_args!("[Security] SMEP enabled\n"));
+        Ok(())
+    }
+    
+    /// Enable SMAP (Supervisor Mode Access Prevention)
+    pub fn enable_smap() -> Result<(), &'static str> {
+        if !super::has_cpu_feature(super::CpuFeature::Smap) {
+            return Err("SMAP not supported by CPU");
+        }
+        
+        unsafe {
+            set_bits(CR4_SMAP);
+        }
+        
+        crate::serial::_print(format_args!("[Security] SMAP enabled\n"));
+        Ok(())
+    }
+    
+    /// Enable UMIP (User-Mode Instruction Prevention)
+    pub fn enable_umip() -> Result<(), &'static str> {
+        if !super::has_cpu_feature(super::CpuFeature::Umip) {
+            return Err("UMIP not supported by CPU");
+        }
+        
+        unsafe {
+            set_bits(CR4_UMIP);
+        }
+        
+        crate::serial::_print(format_args!("[Security] UMIP enabled\n"));
+        Ok(())
+    }
+    
+    /// Initialize security features (SMEP/SMAP/UMIP)
+    pub fn init_security_features() -> Result<(), &'static str> {
+        use alloc::vec::Vec;
+        crate::serial::_print(format_args!("[Security] Initializing CPU security features...\n"));
+        
+        let mut enabled_features = Vec::new();
+        
+        // Enable SMEP if supported
+        if let Ok(()) = enable_smep() {
+            enabled_features.push("SMEP");
+        }
+        
+        // Enable SMAP if supported
+        if let Ok(()) = enable_smap() {
+            enabled_features.push("SMAP");
+        }
+        
+        // Enable UMIP if supported
+        if let Ok(()) = enable_umip() {
+            enabled_features.push("UMIP");
+        }
+        
+        if enabled_features.is_empty() {
+            crate::serial::_print(format_args!("[Security] No CPU security features available\n"));
+            return Err("No security features available");
+        }
+        
+        crate::serial::_print(format_args!(
+            "[Security] Enabled features: {}\n", 
+            enabled_features.join(", ")
+        ));
+        
+        Ok(())
+    }
+    
+    /// Get current CR4 security feature status
+    pub fn get_security_status() -> (bool, bool, bool) {
+        let cr4 = read();
+        (
+            (cr4 & CR4_SMEP) != 0,  // SMEP enabled
+            (cr4 & CR4_SMAP) != 0,  // SMAP enabled
+            (cr4 & CR4_UMIP) != 0,  // UMIP enabled
+        )
+    }
+}
+
+/// Initialize CPU security features
+pub fn init_security_features() -> Result<(), &'static str> {
+    cr4::init_security_features()
+}
+

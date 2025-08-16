@@ -5,7 +5,7 @@ use core::sync::atomic::{AtomicU32, AtomicU64, AtomicBool, Ordering};
 use alloc::vec::Vec;
 use spin::Mutex;
 use lazy_static::lazy_static;
-use x86_64::VirtAddr;
+
 
 use crate::arch;
 use crate::process::ProcessId;

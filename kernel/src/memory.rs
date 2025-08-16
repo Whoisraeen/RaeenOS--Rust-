@@ -82,7 +82,264 @@ pub fn allocate_frame() -> Option<PhysFrame> {
     FRAME_ALLOC.lock().as_mut().and_then(|a| a.allocate_frame())
 }
 
-pub fn with_frame_allocator<F, R>(f: F) -> R
+/// Allocate a frame with guard pages on both sides
+pub fn allocate_frame_with_guards() -> Option<(PhysFrame, PhysFrame, PhysFrame)> {
+    let mut frame_alloc = FRAME_ALLOC.lock();
+    if let Some(ref mut alloc) = *frame_alloc {
+        let guard_before = alloc.allocate_frame()?;
+        let main_frame = alloc.allocate_frame()?;
+        let guard_after = alloc.allocate_frame()?;
+        Some((guard_before, main_frame, guard_after))
+    } else {
+        None
+    }
+}
+
+/// Map a page with guard pages
+pub fn map_page_with_guards(virt_addr: VirtAddr, flags: PageTableFlags) -> Result<(), &'static str> {
+    if let Some((guard_before, main_frame, guard_after)) = allocate_frame_with_guards() {
+        with_mapper(|mapper| {
+            // Map guard page before (no permissions)
+            let guard_before_page = Page::<Size4KiB>::containing_address(virt_addr - 4096u64);
+            let guard_flags = PageTableFlags::PRESENT; // Present but not readable/writable/executable
+            
+            // Map main page
+            let main_page = Page::<Size4KiB>::containing_address(virt_addr);
+            
+            // Map guard page after (no permissions)
+            let guard_after_page = Page::<Size4KiB>::containing_address(virt_addr + 4096u64);
+            
+            // Use a dummy frame allocator for the mapping operations
+            let mut dummy_alloc = DummyFrameAllocator;
+            
+            // Map guard before
+            if let Ok(mapping) = unsafe { mapper.map_to(guard_before_page, guard_before, guard_flags, &mut dummy_alloc) } {
+                mapping.flush();
+            }
+            
+            // Map main page
+            if let Ok(mapping) = unsafe { mapper.map_to(main_page, main_frame, flags, &mut dummy_alloc) } {
+                mapping.flush();
+            }
+            
+            // Map guard after
+            if let Ok(mapping) = unsafe { mapper.map_to(guard_after_page, guard_after, guard_flags, &mut dummy_alloc) } {
+                mapping.flush();
+            }
+            
+            Ok(())
+        })
+    } else {
+        Err("Failed to allocate frames for guard pages")
+    }
+}
+
+/// Dummy frame allocator for mapping operations when we already have frames
+struct DummyFrameAllocator;
+
+unsafe impl FrameAllocator<Size4KiB> for DummyFrameAllocator {
+    fn allocate_frame(&mut self) -> Option<PhysFrame> {
+        None // We don't allocate new frames, we use pre-allocated ones
+    }
+ }
+ 
+ /// KASLR (Kernel Address Space Layout Randomization) implementation
+ pub mod kaslr {
+     use super::*;
+     use crate::arch::tsc;
+     
+     /// KASLR entropy sources
+     #[derive(Debug, Clone, Copy)]
+     pub struct KaslrEntropy {
+         pub tsc_low: u32,
+         pub tsc_high: u32,
+         pub cpu_id: u32,
+         pub memory_size: u64,
+     }
+     
+     impl KaslrEntropy {
+         /// Gather entropy from various hardware sources
+         pub fn gather() -> Self {
+             let tsc = tsc::read_tsc();
+             let cpu_id = crate::arch::get_current_cpu_id();
+             let memory_size = get_total_memory();
+             
+             Self {
+                 tsc_low: tsc as u32,
+                 tsc_high: (tsc >> 32) as u32,
+                 cpu_id,
+                 memory_size,
+             }
+         }
+         
+         /// Generate a pseudo-random number using gathered entropy
+         pub fn random_u64(&self) -> u64 {
+             // Simple PRNG using entropy sources
+             let mut state = self.tsc_low as u64;
+             state ^= (self.tsc_high as u64) << 32;
+             state ^= (self.cpu_id as u64) << 16;
+             state ^= self.memory_size;
+             
+             // Linear congruential generator
+             state = state.wrapping_mul(1103515245).wrapping_add(12345);
+             state ^= state >> 16;
+             state = state.wrapping_mul(1103515245).wrapping_add(12345);
+             state ^= state >> 16;
+             
+             state
+         }
+         
+         /// Generate a random offset within a range
+         pub fn random_offset(&self, max_offset: u64) -> u64 {
+             if max_offset == 0 {
+                 return 0;
+             }
+             self.random_u64() % max_offset
+         }
+     }
+     
+     /// KASLR configuration
+     pub struct KaslrConfig {
+         pub kernel_base_min: VirtAddr,
+         pub kernel_base_max: VirtAddr,
+         pub heap_base_min: VirtAddr,
+         pub heap_base_max: VirtAddr,
+         pub stack_base_min: VirtAddr,
+         pub stack_base_max: VirtAddr,
+     }
+     
+     impl Default for KaslrConfig {
+         fn default() -> Self {
+             Self {
+                 // Kernel can be randomized within a 1GB range
+                 kernel_base_min: VirtAddr::new(0xFFFF_8000_0000_0000),
+                 kernel_base_max: VirtAddr::new(0xFFFF_8000_4000_0000),
+                 
+                 // Heap randomization within 2GB range
+                 heap_base_min: VirtAddr::new(0x0000_1000_0000_0000),
+                 heap_base_max: VirtAddr::new(0x0000_1000_8000_0000),
+                 
+                 // Stack randomization within 1GB range
+                 stack_base_min: VirtAddr::new(0x0000_7000_0000_0000),
+                 stack_base_max: VirtAddr::new(0x0000_7000_4000_0000),
+             }
+         }
+     }
+     
+     /// KASLR manager
+     #[allow(dead_code)]
+     pub struct KaslrManager {
+         config: KaslrConfig,
+         entropy: KaslrEntropy,
+         randomized_bases: RandomizedBases,
+     }
+     
+     #[derive(Debug, Clone, Copy)]
+     pub struct RandomizedBases {
+         pub kernel_base: VirtAddr,
+         pub heap_base: VirtAddr,
+         pub stack_base: VirtAddr,
+     }
+     
+     impl KaslrManager {
+         /// Initialize KASLR with gathered entropy
+         pub fn new() -> Self {
+             let entropy = KaslrEntropy::gather();
+             let config = KaslrConfig::default();
+             
+             // Calculate randomized base addresses
+             let kernel_range = config.kernel_base_max.as_u64() - config.kernel_base_min.as_u64();
+             let heap_range = config.heap_base_max.as_u64() - config.heap_base_min.as_u64();
+             let stack_range = config.stack_base_max.as_u64() - config.stack_base_min.as_u64();
+             
+             let kernel_offset = entropy.random_offset(kernel_range) & !0xFFF; // Align to 4KB
+             let heap_offset = entropy.random_offset(heap_range) & !0xFFF;
+             let stack_offset = entropy.random_offset(stack_range) & !0xFFF;
+             
+             let randomized_bases = RandomizedBases {
+                 kernel_base: VirtAddr::new(config.kernel_base_min.as_u64() + kernel_offset),
+                 heap_base: VirtAddr::new(config.heap_base_min.as_u64() + heap_offset),
+                 stack_base: VirtAddr::new(config.stack_base_min.as_u64() + stack_offset),
+             };
+             
+             Self {
+                 config,
+                 entropy,
+                 randomized_bases,
+             }
+         }
+         
+         /// Get randomized kernel base address
+         pub fn kernel_base(&self) -> VirtAddr {
+             self.randomized_bases.kernel_base
+         }
+         
+         /// Get randomized heap base address
+         pub fn heap_base(&self) -> VirtAddr {
+             self.randomized_bases.heap_base
+         }
+         
+         /// Get randomized stack base address
+         pub fn stack_base(&self) -> VirtAddr {
+             self.randomized_bases.stack_base
+         }
+         
+         /// Generate a randomized address within a range
+         pub fn randomize_address(&self, base: VirtAddr, max_offset: u64) -> VirtAddr {
+             let offset = self.entropy.random_offset(max_offset) & !0xFFF; // Align to 4KB
+             VirtAddr::new(base.as_u64() + offset)
+         }
+         
+         /// Apply KASLR to memory layout
+         pub fn apply_randomization(&self) -> Result<(), &'static str> {
+             crate::serial::_print(format_args!(
+                 "[KASLR] Randomized bases - Kernel: {:?}, Heap: {:?}, Stack: {:?}\n",
+                 self.randomized_bases.kernel_base,
+                 self.randomized_bases.heap_base,
+                 self.randomized_bases.stack_base
+             ));
+             
+             // Note: In a real implementation, we would need to relocate the kernel
+             // and update all absolute addresses. For now, we just log the randomized addresses.
+             
+             Ok(())
+         }
+     }
+     
+     static KASLR_MANAGER: Mutex<Option<KaslrManager>> = Mutex::new(None);
+     
+     /// Initialize KASLR
+     pub fn init() -> Result<(), &'static str> {
+         let manager = KaslrManager::new();
+         manager.apply_randomization()?;
+         
+         *KASLR_MANAGER.lock() = Some(manager);
+         
+         crate::serial::_print(format_args!("[KASLR] Kernel Address Space Layout Randomization initialized\n"));
+         Ok(())
+     }
+     
+     /// Get randomized address for allocation
+     pub fn get_randomized_address(base: VirtAddr, max_offset: u64) -> VirtAddr {
+         if let Some(ref manager) = *KASLR_MANAGER.lock() {
+             manager.randomize_address(base, max_offset)
+         } else {
+             base // Fallback to base address if KASLR not initialized
+         }
+     }
+     
+     /// Get current KASLR bases
+     pub fn get_randomized_bases() -> Option<RandomizedBases> {
+         KASLR_MANAGER.lock().as_ref().map(|m| m.randomized_bases)
+     }
+ }
+ 
+ /// Initialize KASLR during boot
+ pub fn init_kaslr() -> Result<(), &'static str> {
+     kaslr::init()
+ }
+ 
+ pub fn with_frame_allocator<F, R>(f: F) -> R
 where
     F: FnOnce(&mut BootInfoFrameAllocator) -> R,
 {

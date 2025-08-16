@@ -34,12 +34,14 @@ const MSIX_PBA_OFFSET: u8 = 0x08;
 
 /// MSI-X Message Control Register Bits
 const MSIX_ENABLE: u16 = 1 << 15;
+#[allow(dead_code)]
 const MSIX_FUNCTION_MASK: u16 = 1 << 14;
 const MSIX_TABLE_SIZE_MASK: u16 = 0x7FF;
 
 /// MSI-X Table Entry Structure
 #[repr(C, packed)]
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
 struct MsixTableEntry {
     message_addr_low: u32,
     message_addr_high: u32,
@@ -89,7 +91,7 @@ pub struct MsixInfo {
 }
 
 /// Interrupt Vector Allocation
-#[derive(Debug)]
+#[derive(Debug, Copy, Clone)]
 struct InterruptVector {
     vector: u8,
     allocated: bool,
@@ -298,29 +300,37 @@ impl PciManager {
             d.bus == bus && d.device == device && d.function == function
         }).ok_or("Device not found")?;
         
-        let device = &mut self.devices[device_index];
-        let msix_info = device.msix_info.as_mut().ok_or("Device does not support MSI-X")?;
-        
-        if vectors_needed > msix_info.table_size {
-            return Err("Requested more vectors than supported");
-        }
-        
-        // Map MSI-X table and PBA
-        let table_bar_addr = device.bars[msix_info.table_bar as usize] & !0xF;
-        let pba_bar_addr = device.bars[msix_info.pba_bar as usize] & !0xF;
-        
-        if table_bar_addr == 0 || pba_bar_addr == 0 {
-            return Err("Invalid BAR addresses for MSI-X");
-        }
+        // Extract needed information first to avoid borrowing conflicts
+        let (table_bar_addr, pba_bar_addr, table_offset, pba_offset, _table_size, capability_offset) = {
+            let pci_device = &self.devices[device_index];
+            let msix_info = pci_device.msix_info.as_ref().ok_or("Device does not support MSI-X")?;
+            
+            if vectors_needed > msix_info.table_size {
+                return Err("Requested more vectors than supported");
+            }
+            
+            let table_bar_addr = pci_device.bars[msix_info.table_bar as usize] & !0xF;
+            let pba_bar_addr = pci_device.bars[msix_info.pba_bar as usize] & !0xF;
+            
+            if table_bar_addr == 0 || pba_bar_addr == 0 {
+                return Err("Invalid BAR addresses for MSI-X");
+            }
+            
+            (table_bar_addr, pba_bar_addr, msix_info.table_offset, msix_info.pba_offset, 
+              msix_info.table_size, msix_info.capability_offset)
+        };
         
         // Map the MSI-X table (simplified - would need proper memory mapping)
-        let table_phys = PhysAddr::new(table_bar_addr as u64 + msix_info.table_offset as u64);
-        let pba_phys = PhysAddr::new(pba_bar_addr as u64 + msix_info.pba_offset as u64);
+        let table_phys = PhysAddr::new(table_bar_addr as u64 + table_offset as u64);
+        let pba_phys = PhysAddr::new(pba_bar_addr as u64 + pba_offset as u64);
         
-        // For now, just store the physical addresses
-        // In a real implementation, we would map these to virtual addresses
-        msix_info.table_base = Some(VirtAddr::new(table_phys.as_u64()));
-        msix_info.pba_base = Some(VirtAddr::new(pba_phys.as_u64()));
+        // Update the device's MSI-X info
+        {
+            let pci_device = &mut self.devices[device_index];
+            let msix_info = pci_device.msix_info.as_mut().unwrap();
+            msix_info.table_base = Some(VirtAddr::new(table_phys.as_u64()));
+            msix_info.pba_base = Some(VirtAddr::new(pba_phys.as_u64()));
+        }
         
         // Allocate interrupt vectors
         let mut allocated_vectors = Vec::new();
@@ -334,13 +344,14 @@ impl PciManager {
         
         // Configure MSI-X table entries
         for (i, &vector) in allocated_vectors.iter().enumerate() {
+            let msix_info = &self.devices[device_index].msix_info.as_ref().unwrap();
             self.configure_msix_entry(msix_info, i as u16, vector)?;
         }
         
         // Enable MSI-X
-        let mut message_control = read_config_word(bus, device, function, msix_info.capability_offset + MSIX_MESSAGE_CONTROL);
+        let mut message_control = read_config_word(bus, device, function, capability_offset + MSIX_MESSAGE_CONTROL);
         message_control |= MSIX_ENABLE;
-        write_config_word(bus, device, function, msix_info.capability_offset + MSIX_MESSAGE_CONTROL, message_control);
+        write_config_word(bus, device, function, capability_offset + MSIX_MESSAGE_CONTROL, message_control);
         
         crate::serial::_print(format_args!(
             "[PCI] Configured MSI-X for device {:02X}:{:02X}.{} with {} vectors\n",

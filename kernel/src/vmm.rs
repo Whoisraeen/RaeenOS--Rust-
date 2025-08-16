@@ -3,6 +3,7 @@ use alloc::vec::Vec;
 use alloc::boxed::Box;
 use core::fmt;
 use spin::{Mutex, RwLock};
+use bitflags::bitflags;
 use x86_64::{
     structures::paging::{
         Page, PageTable, PageTableFlags, PhysFrame, Size4KiB,
@@ -26,39 +27,57 @@ pub enum VmAreaType {
     Guard,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct VmPermissions(u8);
-
-impl VmPermissions {
-    pub const READ: Self = Self(0x1);
-    pub const WRITE: Self = Self(0x2);
-    pub const EXECUTE: Self = Self(0x4);
-    pub const USER: Self = Self(0x8);
-    pub const GLOBAL: Self = Self(0x10);
-    pub const NO_CACHE: Self = Self(0x20);
-    pub const WRITE_THROUGH: Self = Self(0x40);
-    pub const SWAPPABLE: Self = Self(0x80);
+bitflags! {
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    pub struct VmPermissions: u16 {
+        const READ = 0x01;
+        const WRITE = 0x02;
+        const EXECUTE = 0x04;
+        const USER = 0x08;
+        const GLOBAL = 0x10;
+        const NO_CACHE = 0x20;
+        const WRITE_THROUGH = 0x40;
+        const SWAPPABLE = 0x80;
+        const DUAL_MAPPING = 0x100;
+        const JIT_ALLOWED = 0x200;
+    }
 }
 
 impl VmPermissions {
-    pub const fn empty() -> Self { Self(0) }
+    pub fn readable(self) -> bool { self.contains(Self::READ) }
     
-    pub fn readable(self) -> bool { (self.0 & Self::READ.0) != 0 }
+    pub fn writable(self) -> bool { self.contains(Self::WRITE) }
     
-    pub fn writable(self) -> bool { (self.0 & Self::WRITE.0) != 0 }
+    pub fn executable(self) -> bool { self.contains(Self::EXECUTE) }
     
-    pub fn executable(self) -> bool { (self.0 & Self::EXECUTE.0) != 0 }
-    
-    pub fn user_accessible(self) -> bool { (self.0 & Self::USER.0) != 0 }
-    
-    pub fn contains(self, other: Self) -> bool { (self.0 & other.0) == other.0 }
+    pub fn user_accessible(self) -> bool { self.contains(Self::USER) }
     
     /// Validates W^X policy: writable pages cannot be executable
     pub fn validate_wx_policy(self) -> Result<(), VmError> {
         if self.writable() && self.executable() {
-            Err(VmError::PermissionDenied)
+            Err(VmError::WxViolation)
         } else {
             Ok(())
+        }
+    }
+    
+    /// Check if this is a dual-mapping permission (for JIT support)
+    pub fn is_dual_mapping(self) -> bool {
+        self.contains(Self::DUAL_MAPPING)
+    }
+    
+    /// Validate dual-mapping policy for JIT compilation
+    pub fn validate_dual_mapping_policy(self) -> Result<(), VmError> {
+        if self.is_dual_mapping() {
+            // Dual mappings are allowed to bypass W^X for JIT compilation
+            // but require special handling
+            if !self.contains(Self::JIT_ALLOWED) {
+                return Err(VmError::JitNotAllowed);
+            }
+            Ok(())
+        } else {
+            // Regular mappings must follow W^X policy
+            self.validate_wx_policy()
         }
     }
     
@@ -77,15 +96,15 @@ impl VmPermissions {
             flags |= PageTableFlags::NO_EXECUTE;
         }
         
-        if (self.0 & Self::GLOBAL.0) != 0 {
+        if self.contains(Self::GLOBAL) {
             flags |= PageTableFlags::GLOBAL;
         }
         
-        if (self.0 & Self::NO_CACHE.0) != 0 {
+        if self.contains(Self::NO_CACHE) {
             flags |= PageTableFlags::NO_CACHE;
         }
         
-        if (self.0 & Self::WRITE_THROUGH.0) != 0 {
+        if self.contains(Self::WRITE_THROUGH) {
             flags |= PageTableFlags::WRITE_THROUGH;
         }
         
@@ -93,16 +112,7 @@ impl VmPermissions {
     }
 }
 
-impl core::ops::BitOr for VmPermissions {
-    type Output = Self;
-    fn bitor(self, rhs: Self) -> Self::Output { Self(self.0 | rhs.0) }
-}
-
-impl core::ops::BitOrAssign for VmPermissions {
-    fn bitor_assign(&mut self, rhs: Self) { self.0 |= rhs.0; }
-}
-
-// Duplicate implementation removed - using the first one above
+// BitOr and BitOrAssign implementations are provided by bitflags! macro
 
 #[derive(Debug, Clone)]
 pub struct VmArea {
@@ -255,8 +265,8 @@ impl AddressSpace {
     }
     
     pub fn allocate_area(&mut self, size: u64, area_type: VmAreaType, permissions: VmPermissions) -> Result<VirtAddr, VmError> {
-        // Enforce W^X policy
-        permissions.validate_wx_policy()?;
+        // Enforce W^X policy or dual-mapping policy
+        permissions.validate_dual_mapping_policy()?;
         
         let aligned_size = (size + 0xFFF) & !0xFFF; // Align to 4KB
         
@@ -396,8 +406,8 @@ impl VirtualMemoryManager {
     
     // Update memory protection flags and flush TLB
     pub fn protect_memory(&mut self, as_id: u64, virt_addr: VirtAddr, size: usize, permissions: VmPermissions) -> Result<(), VmError> {
-        // Enforce W^X policy
-        permissions.validate_wx_policy()?;
+        // Enforce W^X policy or dual-mapping policy
+        permissions.validate_dual_mapping_policy()?;
         
         let _address_space = self.get_address_space_mut(as_id)
             .ok_or(VmError::InvalidAddressSpace)?;
@@ -545,8 +555,8 @@ impl VirtualMemoryManager {
     }
     
     fn allocate_page_on_demand(&mut self, _as_id: u64, virt_addr: VirtAddr, permissions: VmPermissions) -> Result<(), VmError> {
-        // Enforce W^X policy
-        permissions.validate_wx_policy()?;
+        // Enforce W^X policy or dual-mapping policy
+        permissions.validate_dual_mapping_policy()?;
         
         let flags = permissions.to_page_table_flags();
         memory::with_mapper(|mapper| {
@@ -627,6 +637,8 @@ pub enum VmError {
     MapError,
     UnmapError,
     TestFailed,
+    WxViolation,
+    JitNotAllowed,
 }
 
 impl fmt::Display for VmError {
@@ -644,6 +656,8 @@ impl fmt::Display for VmError {
             VmError::MapError => write!(f, "Mapping error"),
             VmError::UnmapError => write!(f, "Unmapping error"),
             VmError::TestFailed => write!(f, "Test failed"),
+            VmError::WxViolation => write!(f, "W^X policy violation"),
+            VmError::JitNotAllowed => write!(f, "JIT compilation not allowed"),
         }
     }
 }
@@ -717,7 +731,7 @@ pub fn init() {
             VirtAddr::new(0xFFFF_8000_0010_0000),
             VirtAddr::new(0xFFFF_8000_0020_0000),
             VmAreaType::Data,
-            VmPermissions::WRITE
+            VmPermissions::READ | VmPermissions::WRITE
         );
         let _ = kernel_as.add_area(kernel_data);
         
@@ -726,7 +740,7 @@ pub fn init() {
             VirtAddr::new(0xFFFF_8000_0020_0000),
             VirtAddr::new(0xFFFF_8000_1000_0000),
             VmAreaType::Heap,
-            VmPermissions::WRITE
+            VmPermissions::READ | VmPermissions::WRITE
         );
         let _ = kernel_as.add_area(kernel_heap);
     }
