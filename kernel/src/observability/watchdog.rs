@@ -517,7 +517,15 @@ impl WatchdogManager {
                     id: watchdog.id,
                     subsystem: watchdog.subsystem,
                     name: watchdog.name.clone(),
-                    state: unsafe { core::mem::transmute(watchdog.state.load(Ordering::Relaxed)) },
+                    state: unsafe {
+                        // SAFETY: This is unsafe because:
+                        // - transmute converts between types with same memory representation
+                        // - The atomic u8 value must represent a valid WatchdogState enum variant
+                        // - WatchdogState enum must be repr(u8) with known discriminant values
+                        // - The loaded value must be one of the defined enum variants (0-4)
+                        // - This assumes the atomic was only written with valid enum values
+                        core::mem::transmute(watchdog.state.load(Ordering::Relaxed))
+                    },
                     last_heartbeat: watchdog.last_heartbeat.load(Ordering::Relaxed),
                     failure_count: watchdog.failure_count.load(Ordering::Relaxed),
                     restart_count: watchdog.restart_count.load(Ordering::Relaxed),

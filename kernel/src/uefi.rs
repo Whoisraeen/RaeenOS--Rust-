@@ -593,7 +593,15 @@ impl UefiManager {
             return Err("Invalid system table");
         }
         
-        let system_table_ref = unsafe { &*system_table };
+        let system_table_ref = unsafe {
+            // SAFETY: This is unsafe because:
+            // - system_table must be a valid pointer to an EfiSystemTable
+            // - The pointer is checked for null above but not for validity
+            // - The system table must remain valid for the duration of this reference
+            // - UEFI firmware guarantees the system table pointer validity during boot
+            // - The lifetime of the reference is limited to this function scope
+            &*system_table
+        };
         
         // Verify system table signature
         if system_table_ref.hdr.signature != EFI_SYSTEM_TABLE_SIGNATURE {

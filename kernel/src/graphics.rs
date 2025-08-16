@@ -1077,6 +1077,12 @@ impl FramebufferCompositor {
     /// Present the entire front buffer to hardware framebuffer
     fn present_full(&self) {
         unsafe {
+            // SAFETY: This is unsafe because:
+            // - framebuffer_addr must be a valid, mapped framebuffer memory address
+            // - The framebuffer must be mapped with WRITABLE permissions
+            // - dst_index calculations must not exceed framebuffer bounds
+            // - No other code should be writing to the framebuffer concurrently
+            // - The framebuffer mapping must remain valid during the entire operation
             let fb_ptr = self.framebuffer_addr.as_mut_ptr::<u32>();
             
             for y in 0..self.height {
@@ -1095,6 +1101,12 @@ impl FramebufferCompositor {
     /// Present only dirty regions
     fn present_partial(&self) {
         unsafe {
+            // SAFETY: This is unsafe because:
+            // - framebuffer_addr must be a valid, mapped framebuffer memory address
+            // - The framebuffer must be mapped with WRITABLE permissions
+            // - dst_index calculations must not exceed framebuffer bounds
+            // - dirty_regions must contain valid rectangle coordinates
+            // - No other code should be writing to the framebuffer concurrently
             let fb_ptr = self.framebuffer_addr.as_mut_ptr::<u32>();
             
             for dirty_rect in &self.dirty_regions {
@@ -1275,6 +1287,12 @@ pub fn render_frame() {
         // Present buffer to VGA text buffer region as a coarse preview
         // Map RGBA to ASCII shade for now (very rough fallback display)
         unsafe {
+            // SAFETY: This is unsafe because:
+            // - 0xb8000 is the standard VGA text buffer address in x86 systems
+            // - The VGA text buffer must be mapped and writable
+            // - offset calculations must not exceed the 80x25 VGA text buffer bounds
+            // - volatile writes are required for memory-mapped I/O to VGA hardware
+            // - No other code should be writing to VGA text buffer concurrently
             let vga_ptr = 0xb8000 as *mut u8;
             let mut offset = 0usize;
             let width = core::cmp::min(buffer.width, 80);

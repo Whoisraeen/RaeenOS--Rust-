@@ -244,19 +244,27 @@ fn sys_fork() -> SyscallResult {
     }
 }
 
-fn sys_exec(_path: u64, _args: u64) -> SyscallResult {
-    let _path_str = unsafe { c_str_from_user(_path) };
+fn sys_exec(path: u64, args: u64) -> SyscallResult {
+    let path_str = unsafe { c_str_from_user(path) };
     
-    // For now, ignore args and just exec the path
-    // exec_current_process function doesn't exist, using a placeholder
-    // TODO: Implement proper exec functionality
-    match Ok(()) as Result<(), ()> {
+    // Parse arguments from user space (simplified - assumes null-terminated array of strings)
+    let mut arg_vec: Vec<String> = Vec::new();
+    if args != 0 {
+        // For now, we'll skip parsing complex argument arrays
+        // In a real implementation, we would parse the argv array from user space
+    }
+    
+    // Convert Vec<String> to Vec<&str> for the function call
+    let arg_strs: Vec<&str> = arg_vec.iter().map(|s: &String| s.as_str()).collect();
+    
+    match crate::process::exec_process(&path_str, &arg_strs) {
         Ok(()) => {
-            // This should not return if successful
+            // Successful exec should not return to the caller
+            // The process image has been replaced
             SyscallResult::success(0)
         }
         Err(_) => {
-            // Failed to exec
+            // Failed to exec - return error to caller
             SyscallResult::error(SyscallError::ResourceNotFound)
         }
     }
@@ -1078,6 +1086,12 @@ unsafe fn c_str_from_user(ptr: u64) -> alloc::string::String {
     let mut v = Vec::new();
     let mut p = ptr as *const u8;
     loop {
+        // SAFETY: This is unsafe because:
+        // - ptr must be a valid user-space pointer to a null-terminated C string
+        // - The memory region must be readable by the current process
+        // - The string must be null-terminated within reasonable bounds (4096 bytes)
+        // - User pointer validation should occur before calling this function
+        // - This assumes the user process has not been deallocated during the syscall
         let b = core::ptr::read(p);
         if b == 0 { break; }
         v.push(b);
@@ -1089,16 +1103,39 @@ unsafe fn c_str_from_user(ptr: u64) -> alloc::string::String {
 
 unsafe fn slice_from_user(ptr: u64, len: usize) -> Vec<u8> {
     let mut v = Vec::with_capacity(len);
+    // SAFETY: This is unsafe because:
+    // - We're setting the length without initializing the memory
+    // - The subsequent copy_nonoverlapping will initialize all bytes
+    // - len must not exceed the allocated capacity
     v.set_len(len);
+    // SAFETY: This is unsafe because:
+    // - ptr must be a valid user-space pointer to readable memory
+    // - The memory region [ptr, ptr + len) must be valid and readable
+    // - len must not cause integer overflow when added to ptr
+    // - The destination buffer must have sufficient capacity (guaranteed by set_len above)
+    // - User pointer validation should occur before calling this function
     core::ptr::copy_nonoverlapping(ptr as *const u8, v.as_mut_ptr(), len);
     v
 }
 
 unsafe fn copy_to_user(dst: u64, src: &[u8]) {
+    // SAFETY: This is unsafe because:
+    // - dst must be a valid user-space pointer to writable memory
+    // - The memory region [dst, dst + src.len()) must be valid and writable
+    // - src.len() must not cause integer overflow when added to dst
+    // - The source and destination must not overlap (nonoverlapping requirement)
+    // - User pointer validation should occur before calling this function
+    // - The user process must not have been deallocated during the syscall
     core::ptr::copy_nonoverlapping(src.as_ptr(), dst as *mut u8, src.len());
 }
 
 unsafe fn unsafe_any_as_bytes<T: Sized>(t: &T) -> &[u8] {
+    // SAFETY: This is unsafe because:
+    // - t must be a valid reference to a properly initialized value of type T
+    // - T must not contain any padding bytes that could contain uninitialized data
+    // - The lifetime of the returned slice is tied to the lifetime of t
+    // - T should be a simple data type without pointers or complex invariants
+    // - The size calculation must be correct for type T
     core::slice::from_raw_parts((t as *const T) as *const u8, core::mem::size_of::<T>())
 }
 

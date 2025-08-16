@@ -11,6 +11,11 @@ lazy_static! {
         let mut tss = TaskStateSegment::new();
         const STACK_SIZE: usize = 4096 * 5;
         static mut STACK: [u8; STACK_SIZE] = [0; STACK_SIZE];
+        // SAFETY: This is unsafe because:
+        // - We're taking a reference to a static mutable array
+        // - STACK is only accessed during TSS initialization
+        // - The reference is immediately converted to VirtAddr and not stored
+        // - This occurs during static initialization before any concurrent access
         let stack_start = VirtAddr::from_ptr(unsafe { &STACK });
         let stack_end = stack_start + STACK_SIZE;
         tss.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] = stack_end;
@@ -49,6 +54,13 @@ pub fn init() {
     use x86_64::instructions::segmentation::{CS, DS, ES, FS, GS, SS, Segment};
     use x86_64::instructions::tables::load_tss;
     GDT.0.load();
+    // SAFETY: This is unsafe because:
+    // - Setting segment registers directly affects CPU segmentation state
+    // - Selectors must be valid entries in the loaded GDT
+    // - Must only be called once during system initialization
+    // - Incorrect selectors could cause protection faults or system instability
+    // - TSS selector must point to a valid TSS descriptor
+    // - All selectors are validated to exist in our GDT before use
     unsafe {
         CS::set_reg(GDT.1.kernel_code_selector);
         DS::set_reg(GDT.1.kernel_data_selector);

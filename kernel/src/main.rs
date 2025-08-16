@@ -95,12 +95,28 @@ impl VgaWriter {
 
     fn write_cell(&mut self, row: usize, col: usize, value: VgaChar) {
         let idx = Self::index(row, col);
-        unsafe { core::ptr::write_volatile(self.buffer_ptr.add(idx), value); }
+        unsafe {
+            // SAFETY: This is unsafe because:
+            // - buffer_ptr must be a valid pointer to VGA text buffer memory (0xb8000)
+            // - The index must be within VGA buffer bounds (checked by Self::index)
+            // - Volatile write is required for MMIO to ensure immediate hardware effect
+            // - The VGA buffer must be properly mapped and accessible
+            // - No other code should be writing to the same VGA cell concurrently
+            core::ptr::write_volatile(self.buffer_ptr.add(idx), value);
+        }
     }
 
     fn read_cell(&self, row: usize, col: usize) -> VgaChar {
         let idx = Self::index(row, col);
-        unsafe { core::ptr::read_volatile(self.buffer_ptr.add(idx)) }
+        unsafe {
+            // SAFETY: This is unsafe because:
+            // - buffer_ptr must be a valid pointer to VGA text buffer memory (0xb8000)
+            // - The index must be within VGA buffer bounds (checked by Self::index)
+            // - Volatile read is required for MMIO to get current hardware state
+            // - The VGA buffer must be properly mapped and accessible
+            // - Reading from VGA memory is always safe and doesn't modify state
+            core::ptr::read_volatile(self.buffer_ptr.add(idx))
+        }
     }
 }
 

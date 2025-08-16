@@ -118,7 +118,16 @@ impl TarFileSystem {
         }
         
         let header_bytes = &self.data[offset..offset + TAR_BLOCK_SIZE];
-        let header = unsafe { &*(header_bytes.as_ptr() as *const TarHeader) };
+        let header = unsafe {
+            // SAFETY: This is unsafe because:
+            // - header_bytes must be exactly TAR_BLOCK_SIZE (512) bytes long
+            // - The slice bounds have been checked above to ensure sufficient data
+            // - TarHeader is a repr(C) struct with known layout matching TAR format
+            // - The pointer cast assumes proper alignment (TAR headers are byte-aligned)
+            // - The lifetime of the reference is tied to the slice lifetime
+            // - No mutable access to the underlying data occurs during this reference
+            &*(header_bytes.as_ptr() as *const TarHeader)
+        };
         
         // Verify magic number
         if &header.magic[..5] != TAR_MAGIC {

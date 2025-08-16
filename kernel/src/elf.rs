@@ -84,6 +84,12 @@ impl ElfLoader {
         }
         
         // Parse ELF header
+        // SAFETY: This is unsafe because:
+        // - `data.as_ptr()` must point to valid memory containing an ELF header
+        // - We've verified `data.len() >= size_of::<ElfHeader>()` above
+        // - The cast to `*const ElfHeader` assumes proper alignment and layout
+        // - `core::ptr::read` performs an unaligned read which is safe for packed structs
+        // - The data buffer remains valid for the duration of this read
         let header = unsafe {
             core::ptr::read(data.as_ptr() as *const ElfHeader)
         };
@@ -128,9 +134,19 @@ impl ElfLoader {
             
             // Process each loadable segment
             for i in 0..ph_count {
+                // SAFETY: This is unsafe because:
+                // - `self.data.as_ptr().add()` performs pointer arithmetic
+                // - We've validated that `ph_offset + (i * ph_size)` is within bounds above
+                // - The cast to `*const ProgramHeader` assumes proper struct layout
+                // - The data buffer remains valid throughout this operation
                 let ph_ptr = unsafe {
                     self.data.as_ptr().add(ph_offset + (i * ph_size)) as *const ProgramHeader
                 };
+                // SAFETY: This is unsafe because:
+                // - `ph_ptr` points to valid memory within the data buffer
+                // - We've verified the bounds above to ensure the read is within the buffer
+                // - `core::ptr::read` performs an unaligned read which is safe for packed structs
+                // - The ProgramHeader struct layout matches the ELF specification
                 let ph = unsafe { core::ptr::read(ph_ptr) };
                 
                 // Only process loadable segments

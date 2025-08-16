@@ -150,7 +150,16 @@ impl Tpm {
         }
         
         let addr = self.base_addr + offset as u64;
-        let value = unsafe { core::ptr::read_volatile(addr as *const u32) };
+        let value = unsafe {
+            // SAFETY: This is unsafe because:
+            // - addr must be a valid, mapped TPM register address
+            // - The TPM base address must be properly configured and accessible
+            // - The offset must be within valid TPM register range
+            // - Volatile read is required for MMIO to prevent compiler optimizations
+            // - The address must be properly aligned for u32 access
+            // - TPM presence has been verified above
+            core::ptr::read_volatile(addr as *const u32)
+        };
         Ok(value)
     }
     
@@ -162,7 +171,16 @@ impl Tpm {
         }
         
         let addr = self.base_addr + offset as u64;
-        unsafe { core::ptr::write_volatile(addr as *mut u32, value) };
+        unsafe {
+            // SAFETY: This is unsafe because:
+            // - addr must be a valid, mapped TPM register address
+            // - The TPM base address must be properly configured and accessible
+            // - The offset must be within valid TPM register range
+            // - Volatile write is required for MMIO to ensure immediate hardware effect
+            // - The address must be properly aligned for u32 access
+            // - TPM presence has been verified above
+            core::ptr::write_volatile(addr as *mut u32, value);
+        }
         Ok(())
     }
     

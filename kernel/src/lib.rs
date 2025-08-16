@@ -102,8 +102,8 @@ pub fn init(boot_info: &'static bootloader::BootInfo) {
     process::init();
     
     // Initialize threading system
-    let idle_pid = process::init_idle_thread();
-    let demo_pid = process::spawn_demo_thread();
+    let idle_pid = process::init_idle_thread().expect("Failed to initialize idle thread");
+    let demo_pid = process::spawn_demo_thread().expect("Failed to spawn demo thread");
     crate::serial::_print(format_args!("Initialized idle thread (PID: {}) and demo thread (PID: {})\n", idle_pid, demo_pid));
     
     syscall::init();

@@ -729,6 +729,12 @@ pub mod tsc {
     #[inline]
     pub fn read_tsc() -> u64 {
         unsafe {
+            // SAFETY: This is unsafe because:
+            // - Uses inline assembly with the RDTSC instruction
+            // - RDTSC is a privileged instruction that reads CPU timestamp counter
+            // - The instruction is serializing and affects CPU state
+            // - Assembly constraints are correctly specified (nomem, nostack)
+            // - Output registers (EAX, EDX) are properly captured
             let mut low: u32;
             let mut high: u32;
             core::arch::asm!(
@@ -985,6 +991,12 @@ pub mod cr4 {
     pub fn read() -> u64 {
         let cr4: u64;
         unsafe {
+            // SAFETY: This is unsafe because:
+            // - Reading CR4 is a privileged operation that requires kernel mode
+            // - The inline assembly must use correct x86-64 syntax and constraints
+            // - The `nomem, nostack` options ensure no memory or stack side effects
+            // - The output register constraint must match the target variable type
+            // - This operation cannot be interrupted or cause exceptions in normal operation
             core::arch::asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack));
         }
         cr4

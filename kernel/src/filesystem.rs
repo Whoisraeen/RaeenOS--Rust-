@@ -835,6 +835,12 @@ unsafe impl Sync for CrashSafeFile {}
 impl File for CrashSafeFile {
     fn read(&mut self, buffer: &mut [u8]) -> FileSystemResult<usize> {
         unsafe {
+            // SAFETY: This is unsafe because:
+            // - self.filesystem must be a valid pointer to a CrashSafeFileSystem
+            // - The filesystem must remain valid for the duration of this operation
+            // - No other code should be deallocating the filesystem concurrently
+            // - The Send/Sync implementation guarantees thread safety
+            // - The file must not have been closed or invalidated
             let fs = &mut *self.filesystem;
             if let Some(block) = fs.blocks.get(&self.block_id) {
                 let start = self.position as usize;
@@ -855,6 +861,12 @@ impl File for CrashSafeFile {
 
     fn write(&mut self, buffer: &[u8]) -> FileSystemResult<usize> {
         unsafe {
+            // SAFETY: This is unsafe because:
+            // - self.filesystem must be a valid pointer to a CrashSafeFileSystem
+            // - The filesystem must remain valid for the duration of this operation
+            // - No other code should be deallocating the filesystem concurrently
+            // - The Send/Sync implementation guarantees thread safety
+            // - The file must not have been closed or invalidated
             let fs = &mut *self.filesystem;
             let transaction_id = fs.begin_transaction();
             
@@ -933,6 +945,12 @@ impl File for CrashSafeFile {
 
     fn flush(&mut self) -> FileSystemResult<()> {
         unsafe {
+            // SAFETY: This is unsafe because:
+            // - self.filesystem must be a valid pointer to a CrashSafeFileSystem
+            // - The filesystem must remain valid for the duration of this operation
+            // - No other code should be deallocating the filesystem concurrently
+            // - The Send/Sync implementation guarantees thread safety
+            // - The file must not have been closed or invalidated
             let fs = &mut *self.filesystem;
             fs.write_barrier()
         }
@@ -940,6 +958,12 @@ impl File for CrashSafeFile {
 
     fn metadata(&self) -> FileSystemResult<FileMetadata> {
         unsafe {
+            // SAFETY: This is unsafe because:
+            // - self.filesystem must be a valid pointer to a CrashSafeFileSystem
+            // - The filesystem must remain valid for the duration of this operation
+            // - No other code should be deallocating the filesystem concurrently
+            // - The Send/Sync implementation guarantees thread safety
+            // - The file must not have been closed or invalidated
             let fs = &*self.filesystem;
             if let Some(block) = fs.blocks.get(&self.block_id) {
                 let mut metadata = FileMetadata::default();

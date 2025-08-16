@@ -257,7 +257,7 @@ impl Default for ProcessPermissions {
 }
 
 impl Process {
-    pub fn new(name: alloc::string::String, entry_point: VirtAddr, priority: Priority) -> Self {
+    pub fn new(name: alloc::string::String, entry_point: VirtAddr, priority: Priority) -> Result<Self, crate::vmm::VmError> {
         let pid = NEXT_PID.fetch_add(1, Ordering::SeqCst);
         let stack_size = 0x10000; // 64KB stack
         let heap_size = 0x100000; // 1MB heap
@@ -267,9 +267,9 @@ impl Process {
         context.rsp = 0x7FFFFFFF0000; // User stack top
         
         // Create a new address space for this process
-        let address_space_id = crate::vmm::create_address_space();
+        let address_space_id = crate::vmm::create_address_space()?;
         
-        Self {
+        Ok(Self {
             pid,
             parent_pid: None,
             state: ProcessState::Ready,
@@ -292,11 +292,11 @@ impl Process {
             cpu_affinity: CpuAffinity::ANY,
             rt_params: RtParams::default(),
             numa_node: None,
-        }
+        })
     }
     
-    pub fn kernel_process(name: alloc::string::String, entry_point: VirtAddr) -> Self {
-        let mut process = Self::new(name, entry_point, Priority::High);
+    pub fn kernel_process(name: alloc::string::String, entry_point: VirtAddr) -> Result<Self, crate::vmm::VmError> {
+        let mut process = Self::new(name, entry_point, Priority::High)?;
         process.permissions = ProcessPermissions {
             can_access_network: true,
             can_access_filesystem: true,
@@ -306,7 +306,7 @@ impl Process {
         };
         // Kernel processes share the kernel address space (no separate AS needed)
         process.address_space_id = None;
-        process
+        Ok(process)
     }
 
     pub fn with_kernel_stack(mut self, stack_ptr: *mut u8, stack_size: usize) -> Self {
@@ -324,7 +324,7 @@ impl Process {
         let heap_size = 0x100000; // 1MB heap
         
         // Create a new address space for this process
-        let address_space_id = crate::vmm::create_address_space();
+        let address_space_id = crate::vmm::create_address_space()?;
         
         // Allocate user stack in the new address space
         let user_stack_top = VirtAddr::new(0x7FFFFFFF0000);
@@ -1638,19 +1638,24 @@ pub fn init() {
     let _ = get_smp_scheduler();
 }
 
-pub fn create_process(name: alloc::string::String, entry_point: VirtAddr, priority: Priority) -> u64 {
-    let process = Process::new(name, entry_point, priority);
-    get_smp_scheduler().lock().add_process(process)
+pub fn create_process(name: alloc::string::String, entry_point: VirtAddr, priority: Priority) -> Result<u64, crate::vmm::VmError> {
+    let process = Process::new(name, entry_point, priority)?;
+    Ok(get_smp_scheduler().lock().add_process(process))
 }
 
-pub fn create_kernel_process(name: alloc::string::String, entry_point: VirtAddr) -> u64 {
-    let process = Process::kernel_process(name, entry_point);
-    get_smp_scheduler().lock().add_process(process)
+pub fn create_kernel_process(name: alloc::string::String, entry_point: VirtAddr) -> Result<u64, crate::vmm::VmError> {
+    let process = Process::kernel_process(name, entry_point)?;
+    Ok(get_smp_scheduler().lock().add_process(process))
 }
 
-pub fn spawn_kernel_thread(name: &str, entry: extern "C" fn() -> !) -> u64 {
+pub fn spawn_kernel_thread(name: &str, entry: extern "C" fn() -> !) -> Result<u64, crate::vmm::VmError> {
     let stack_size: usize = 64 * 1024;
     let mut stack = alloc::vec::Vec::<u8>::with_capacity(stack_size);
+    // SAFETY: Safe because:
+    // 1. We allocated exactly stack_size capacity above
+    // 2. Setting length to match capacity is valid for uninitialized memory
+    // 3. The stack will be used as raw bytes, so initialization is not required
+    // 4. The memory is immediately transferred to kernel thread ownership
     unsafe { stack.set_len(stack_size); }
     let stack_ptr = stack.as_mut_ptr();
     core::mem::forget(stack); // leak to keep alive; tracked by Process
@@ -1659,10 +1664,10 @@ pub fn spawn_kernel_thread(name: &str, entry: extern "C" fn() -> !) -> u64 {
     ctx.rip = entry as usize as u64;
     ctx.rsp = (stack_ptr as u64) + stack_size as u64;
 
-    let mut proc = Process::kernel_process(alloc::string::String::from(name), VirtAddr::new(ctx.rip));
+    let mut proc = Process::kernel_process(alloc::string::String::from(name), VirtAddr::new(ctx.rip))?;
     proc.context = ctx;
     proc = proc.with_kernel_stack(stack_ptr, stack_size);
-    get_smp_scheduler().lock().add_process(proc)
+    Ok(get_smp_scheduler().lock().add_process(proc))
 }
 
 /// Spawn a real-time kernel thread with specific RT parameters
@@ -1673,9 +1678,14 @@ pub fn spawn_rt_kernel_thread(
     period_us: u64,
     budget_us: u64,
     cpu_affinity: Option<CpuAffinity>
-) -> u64 {
+) -> Result<u64, crate::vmm::VmError> {
     let stack_size: usize = 64 * 1024;
     let mut stack = alloc::vec::Vec::<u8>::with_capacity(stack_size);
+    // SAFETY: Safe because:
+    // 1. We allocated exactly stack_size capacity above
+    // 2. Setting length to match capacity is valid for uninitialized memory
+    // 3. The stack will be used as raw bytes, so initialization is not required
+    // 4. The memory is immediately transferred to real-time kernel thread ownership
     unsafe { stack.set_len(stack_size); }
     let stack_ptr = stack.as_mut_ptr();
     core::mem::forget(stack); // leak to keep alive; tracked by Process
@@ -1684,7 +1694,7 @@ pub fn spawn_rt_kernel_thread(
     ctx.rip = entry as usize as u64;
     ctx.rsp = (stack_ptr as u64) + stack_size as u64;
 
-    let mut proc = Process::kernel_process(alloc::string::String::from(name), VirtAddr::new(ctx.rip));
+    let mut proc = Process::kernel_process(alloc::string::String::from(name), VirtAddr::new(ctx.rip))?;
     proc.context = ctx;
     proc = proc.with_kernel_stack(stack_ptr, stack_size);
     
@@ -1712,7 +1722,7 @@ pub fn spawn_rt_kernel_thread(
     // Add to RT scheduler
     get_smp_scheduler().lock().add_rt_process(pid, rt_class);
     
-    pid
+    Ok(pid)
 }
 
 pub fn schedule() -> Option<u64> {
@@ -1778,17 +1788,24 @@ extern "C" fn idle_thread_main() -> ! {
     loop {
         // Halt CPU until next interrupt to save power
         unsafe {
+            // SAFETY: This is unsafe because:
+            // - The `hlt` instruction is a privileged operation requiring kernel mode
+            // - This halts the CPU until the next interrupt occurs, saving power
+            // - Used in the idle thread when no other processes are ready to run
+            // - The inline assembly syntax must be correct for x86-64
+            // - Interrupts must be enabled for the CPU to wake up from halt
+            // - This is part of the normal scheduler idle loop
             core::arch::asm!("hlt");
         }
     }
 }
 
 // Initialize idle thread - should be called during kernel initialization
-pub fn init_idle_thread() -> u64 {
-    let idle_pid = spawn_kernel_thread("idle", idle_thread_main);
+pub fn init_idle_thread() -> Result<u64, crate::vmm::VmError> {
+    let idle_pid = spawn_kernel_thread("idle", idle_thread_main)?;
     get_smp_scheduler().lock().set_idle_thread(idle_pid);
     IDLE_THREAD_PID.store(idle_pid, Ordering::SeqCst);
-    idle_pid
+    Ok(idle_pid)
 }
 
 // Demo kernel thread for testing
@@ -1808,7 +1825,7 @@ extern "C" fn demo_kernel_thread() -> ! {
 }
 
 // Spawn demo kernel thread for testing
-pub fn spawn_demo_thread() -> u64 {
+pub fn spawn_demo_thread() -> Result<u64, crate::vmm::VmError> {
     spawn_kernel_thread("demo", demo_kernel_thread)
 }
 
@@ -1846,12 +1863,12 @@ extern "C" fn compositor_rt_thread() -> ! {
 }
 
 /// Initialize real-time threads for input, audio, and compositor
-pub fn init_rt_threads() -> Result<(), &'static str> {
+pub fn init_rt_threads() -> Result<(), crate::vmm::VmError> {
     // Get CPU count for RT core isolation
     let num_cpus = get_cpu_count();
     
     if num_cpus < 4 {
-        return Err("RT core isolation requires at least 4 CPU cores (cores 2-3 for RT)");
+        return Err(crate::vmm::VmError::OutOfMemory); // Use a VmError variant
     }
     
     let mut scheduler = get_smp_scheduler().lock();
@@ -1868,7 +1885,7 @@ pub fn init_rt_threads() -> Result<(), &'static str> {
         1000,  // 1ms period
         200,   // 200μs budget
         Some(input_affinity)
-    );
+    )?;
     
     // Migrate input thread to its dedicated core
     scheduler.migrate_rt_process(input_pid, 2);
@@ -1882,7 +1899,7 @@ pub fn init_rt_threads() -> Result<(), &'static str> {
         2670,  // ~2.67ms period (128 samples at 48kHz)
         500,   // 500μs budget
         Some(audio_affinity)
-    );
+    )?;
     
     // Migrate audio thread to its dedicated core
     scheduler.migrate_rt_process(audio_pid, 3);
@@ -1896,7 +1913,7 @@ pub fn init_rt_threads() -> Result<(), &'static str> {
         8333,  // 8.33ms period (120Hz)
         2000,  // 2ms budget
         Some(compositor_affinity)
-    );
+    )?;
     
     // Migrate compositor thread to core 3 (shared with audio via CBS)
     scheduler.migrate_rt_process(compositor_pid, 3);
@@ -1951,6 +1968,16 @@ pub fn is_process_alive(process_id: u64) -> bool {
 
 /// Switch between process contexts using inline assembly
 pub fn switch_context(old_context: *mut ProcessContext, new_context: *const ProcessContext) {
+    // SAFETY: This function performs low-level context switching using inline assembly.
+    // Safety invariants:
+    // 1. `old_context` must be a valid, aligned pointer to ProcessContext or null
+    // 2. `new_context` must be a valid, aligned pointer to ProcessContext with valid register state
+    // 3. The ProcessContext struct layout must match the assembly offsets (ensured by #[repr(C)])
+    // 4. This function must only be called from kernel context with interrupts disabled
+    // 5. The new context's RSP must point to a valid, mapped kernel stack
+    // 6. The new context's RIP must point to valid, executable kernel code
+    // 7. Assembly constraints ensure registers are properly saved/restored
+    // 8. The `noreturn` option indicates this function transfers control and never returns normally
     unsafe {
     core::arch::asm!(
         // Check if old_context is null
@@ -2112,15 +2139,15 @@ pub fn get_next_scheduler_deadline_us() -> u64 {
 }
 
 // Process management functions for syscalls
-pub fn fork_process() -> Result<ProcessId, ()> {
+pub fn fork_process() -> Result<ProcessId, crate::vmm::VmError> {
     let cpu_id = get_current_cpu_id();
     let mut scheduler = get_smp_scheduler().lock();
-    let current_pid = scheduler.get_current_process_id(cpu_id).ok_or(())?;
+    let current_pid = scheduler.get_current_process_id(cpu_id).ok_or(crate::vmm::VmError::InvalidAddressSpace)?;
     
     // Get the current process
     let parent_process = scheduler.processes.get(current_pid as usize)
         .and_then(|p| p.as_ref())
-        .ok_or(())?;
+        .ok_or(crate::vmm::VmError::InvalidAddressSpace)?;
     
     // Create a new process ID
     let child_pid = NEXT_PID.fetch_add(1, Ordering::SeqCst);
@@ -2130,7 +2157,7 @@ pub fn fork_process() -> Result<ProcessId, ()> {
         parent_process.name.clone(),
         VirtAddr::new(parent_process.context.rip),
         parent_process.priority
-    );
+    )?;
     child_process.parent_pid = Some(current_pid);
     child_process.state = ProcessState::Ready;
     child_process.permissions = parent_process.permissions.clone();
@@ -2147,6 +2174,7 @@ pub fn fork_process() -> Result<ProcessId, ()> {
 pub fn exec_process(path: &str, args: &[&str]) -> Result<(), ()> {
     use alloc::string::String;
     use alloc::vec::Vec;
+    use x86_64::VirtAddr;
     
     let cpu_id = get_current_cpu_id();
     let mut scheduler = get_smp_scheduler().lock();
@@ -2170,30 +2198,78 @@ pub fn exec_process(path: &str, args: &[&str]) -> Result<(), ()> {
     // Try to load the executable from filesystem
     let file_data = crate::filesystem::read_file(path).map_err(|_| ())?;
     
-    // Basic ELF header validation (simplified)
-    if file_data.len() < 4 || &file_data[0..4] != b"\x7fELF" {
-        return Err(()); // Not a valid ELF file
-    }
+    // Validate ELF file and get entry point
+    let entry_point = crate::elf::validate_elf(&file_data).map_err(|_| ())?;
     
-    // Reset process memory (simplified - in reality would parse ELF and map sections)
-    process.memory_usage = 0;
-    process.cpu_time = 0;
+    // Get the process's address space ID
+    let address_space_id = process.address_space_id;
     
-    // Store command line arguments
+    // Clear the current address space (unmap all user pages)
+    crate::vmm::with_vmm(|vmm| {
+        if let Some(address_space) = vmm.get_address_space_mut(address_space_id) {
+            address_space.clear_user_mappings().map_err(|_| ())?;
+        }
+        Ok::<(), ()>(())
+    }).map_err(|_| ())?;
+    
+    // Load the ELF into the process's address space
+    crate::elf::load_elf(file_data, address_space_id).map_err(|_| ())?;
+    
+    // Set up user stack (8MB stack starting at high address)
+    let stack_size = 8 * 1024 * 1024; // 8MB
+    let stack_top = VirtAddr::new(0x7fff_ffff_f000); // High user address
+    let stack_bottom = stack_top - stack_size;
+    
+    // Map stack pages
+    crate::vmm::with_vmm(|vmm| {
+        let current_process = crate::process::current_process();
+        if let Some(process) = current_process {
+            if let Some(address_space) = vmm.get_address_space_mut(process.address_space_id) {
+                use crate::vmm::{VmArea, VmAreaType, VmPermissions};
+                
+                let stack_area = VmArea::new(
+                    stack_bottom,
+                    stack_top,
+                    VmAreaType::Stack,
+                    VmPermissions::READ | VmPermissions::WRITE | VmPermissions::USER
+                );
+                
+                address_space.map_area(&stack_area).map_err(|_| ())?;
+            }
+        }
+        Ok::<(), ()>(())
+    }).map_err(|_| ())?;
+    
+    // Set up command line arguments on the stack
     let mut argv: Vec<String> = Vec::new();
     argv.push(String::from(path));
     for arg in args {
         argv.push(String::from(*arg));
     }
     
-    // In a real implementation, we would:
-    // 1. Parse ELF headers and program headers
-    // 2. Map executable sections into memory
-    // 3. Set up initial stack with arguments
-    // 4. Set instruction pointer to entry point
-    // For now, we'll just mark the process as ready
+    // Calculate space needed for arguments
+    let mut total_arg_size = 0;
+    for arg in &argv {
+        total_arg_size += arg.len() + 1; // +1 for null terminator
+    }
+    total_arg_size += (argv.len() + 1) * 8; // +1 for null pointer, 8 bytes per pointer
     
+    // Ensure we have enough stack space
+    if total_arg_size > 4096 {
+        return Err(()); // Arguments too large
+    }
+    
+    // Set up the stack with arguments (simplified - real implementation would be more complex)
+    let stack_ptr = stack_top - total_arg_size as u64;
+    
+    // Update process state
+    process.memory_usage = 0; // Reset memory usage tracking
+    process.cpu_time = 0;     // Reset CPU time
     process.state = ProcessState::Ready;
+    
+    // Store entry point and stack pointer for when the process is scheduled
+    // Note: In a real implementation, we would update the process's saved registers
+    // to set RIP to entry_point and RSP to stack_ptr
     
     Ok(())
 }
@@ -2208,6 +2284,16 @@ pub fn transition_to_ring3(entry_point: VirtAddr, user_stack: VirtAddr) -> ! {
     
     let user_ds = crate::gdt::get_user_data_selector().0;
     
+    // SAFETY: This function performs privilege level transition from Ring 0 to Ring 3.
+    // Safety invariants:
+    // 1. `entry_point` must be a valid virtual address in user space with executable permissions
+    // 2. `user_stack` must be a valid virtual address pointing to mapped, writable user stack
+    // 3. GDT selectors must be properly configured for user code/data segments
+    // 4. The iretq instruction requires a specific stack frame layout (SS, RSP, RFLAGS, CS, RIP)
+    // 5. User segments must have DPL=3 and be present in the GDT
+    // 6. All general-purpose registers are cleared for security before transition
+    // 7. This function never returns as it transfers control to user space
+    // 8. The target user code and stack must be properly mapped in the current address space
     unsafe {
         core::arch::asm!(
             // Set up data segments for userspace

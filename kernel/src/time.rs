@@ -76,6 +76,12 @@ fn bcd_to_binary(bcd: u8) -> u8 {
 
 fn read_rtc_register(reg: u16) -> u8 {
     unsafe {
+        // SAFETY: This is unsafe because:
+        // - CMOS_ADDRESS (0x70) and CMOS_DATA (0x71) are standard x86 CMOS/RTC I/O ports
+        // - Port I/O requires privileged instructions that can affect system state
+        // - The two-step process (write address, read data) must be atomic
+        // - No other code should access CMOS ports concurrently
+        // - reg parameter must be a valid RTC register offset
         let mut addr_port = Port::new(CMOS_ADDRESS);
         let mut data_port = Port::new(CMOS_DATA);
         

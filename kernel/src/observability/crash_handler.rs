@@ -590,6 +590,12 @@ impl CrashHandler {
         // 3. Halting the processor
         loop {
             unsafe {
+                // SAFETY: This is unsafe because:
+                // - The `hlt` instruction is a privileged operation requiring kernel mode
+                // - This halts the CPU until the next interrupt occurs
+                // - Used in crash handling context where system stability is compromised
+                // - The inline assembly syntax must be correct for x86-64
+                // - This is part of emergency system shutdown procedure
                 core::arch::asm!("hlt");
             }
         }

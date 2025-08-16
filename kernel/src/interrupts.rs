@@ -7,6 +7,11 @@ use x86_64::instructions::port::Port;
 pub const PIC_1_OFFSET: u8 = 32;
 pub const PIC_2_OFFSET: u8 = PIC_1_OFFSET + 8;
 
+// SAFETY: This is unsafe because:
+// - ChainedPics::new accesses hardware I/O ports for PIC configuration
+// - PIC_1_OFFSET and PIC_2_OFFSET must be valid interrupt vector offsets
+// - This must only be called once during system initialization
+// - The offsets must not conflict with CPU exception vectors (0-31)
 pub static PICS: Mutex<ChainedPics> = Mutex::new(unsafe { ChainedPics::new(PIC_1_OFFSET, PIC_2_OFFSET) });
 
 lazy_static! {
@@ -35,6 +40,11 @@ impl InterruptIndex {
 
 pub fn init() {
     IDT.load();
+    // SAFETY: This is unsafe because:
+    // - Initializes hardware PICs via I/O port access
+    // - Must only be called once during system initialization
+    // - Requires that interrupts are disabled during initialization
+    // - PIC configuration affects global interrupt routing
     unsafe { PICS.lock().initialize() };
     x86_64::instructions::interrupts::enable();
 }
@@ -79,6 +89,11 @@ extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFr
     if crate::apic::is_apic_enabled() {
         crate::apic::send_eoi();
     } else {
+        // SAFETY: This is unsafe because:
+        // - Sends EOI (End of Interrupt) signal to PIC hardware via I/O ports
+        // - Must only be called from within the corresponding interrupt handler
+        // - Timer interrupt vector must match the configured PIC offset
+        // - Required to re-enable further timer interrupts
         unsafe {
             PICS.lock().notify_end_of_interrupt(InterruptIndex::Timer.as_u8());
         }
@@ -87,11 +102,21 @@ extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFr
 
 extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStackFrame) {
     let mut port = Port::new(0x60);
+    // SAFETY: This is unsafe because:
+    // - Reads from keyboard controller I/O port 0x60
+    // - Port 0x60 is the standard keyboard data port on x86 systems
+    // - Must be called from keyboard interrupt handler to clear the interrupt
+    // - Reading clears the keyboard controller's output buffer
     let _scancode: u8 = unsafe { port.read() };
     
     if crate::apic::is_apic_enabled() {
         crate::apic::send_eoi();
     } else {
+        // SAFETY: This is unsafe because:
+        // - Sends EOI (End of Interrupt) signal to PIC hardware via I/O ports
+        // - Must only be called from within the corresponding interrupt handler
+        // - Keyboard interrupt vector must match the configured PIC offset
+        // - Required to re-enable further keyboard interrupts
         unsafe {
             PICS.lock().notify_end_of_interrupt(InterruptIndex::Keyboard.as_u8());
         }

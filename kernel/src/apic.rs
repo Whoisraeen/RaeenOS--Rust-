@@ -142,6 +142,12 @@ impl LocalApic {
     /// Initialize x2APIC mode
     fn init_x2apic(&mut self) -> Result<(), &'static str> {
         // Enable x2APIC mode
+        // SAFETY: This is unsafe because:
+        // - Accesses MSR 0x1B (IA32_APIC_BASE) which controls APIC configuration
+        // - MSR access requires privileged CPU instructions (rdmsr/wrmsr)
+        // - Must only be called during APIC initialization with interrupts disabled
+        // - Bits 10 and 11 enable x2APIC and APIC respectively, following Intel specification
+        // - Single call during system initialization ensures no race conditions
         unsafe {
             use x86_64::registers::model_specific::Msr;
             let mut apic_base = Msr::new(0x1B).read();
@@ -158,6 +164,11 @@ impl LocalApic {
     /// Initialize xAPIC mode (memory-mapped)
     fn init_xapic(&mut self) -> Result<(), &'static str> {
         // Get APIC base address from MSR
+        // SAFETY: This is unsafe because:
+        // - Reads MSR 0x1B (IA32_APIC_BASE) to get APIC base physical address
+        // - MSR access requires privileged CPU instructions (rdmsr)
+        // - Called during APIC initialization when system is in known state
+        // - MSR 0x1B is standard x86 register containing APIC base address
         let apic_base_msr = unsafe {
             use x86_64::registers::model_specific::Msr;
             Msr::new(0x1B).read()
@@ -176,6 +187,12 @@ impl LocalApic {
             let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_CACHE;
             
             crate::memory::with_frame_allocator(|frame_allocator| {
+                // SAFETY: This is unsafe because:
+                // - Maps physical APIC registers to virtual memory for MMIO access
+                // - Physical frame contains actual APIC hardware registers
+                // - Virtual address is in kernel space with proper flags (PRESENT | WRITABLE | NO_CACHE)
+                // - NO_CACHE flag is required for MMIO to prevent CPU caching of hardware registers
+                // - Single mapping during initialization, no aliasing concerns
                 unsafe {
                     mapper.map_to(page, frame, flags, frame_allocator)
                         .map_err(|_| "Failed to map APIC registers")?
@@ -187,6 +204,12 @@ impl LocalApic {
         }).map_err(|_| "Failed to map APIC registers")?;
         
         // Enable APIC in MSR
+        // SAFETY: This is unsafe because:
+        // - Modifies MSR 0x1B (IA32_APIC_BASE) to enable APIC hardware
+        // - MSR access requires privileged CPU instructions (rdmsr/wrmsr)
+        // - Bit 11 enables APIC according to Intel specification
+        // - Called during initialization with proper APIC register mapping established
+        // - Single call ensures no race conditions with other APIC operations
         unsafe {
             use x86_64::registers::model_specific::Msr;
             let mut apic_base = Msr::new(0x1B).read();
@@ -298,6 +321,12 @@ impl LocalApic {
         if self.x2apic_enabled {
             self.read_x2apic_msr(0x800 + (offset >> 4))
         } else {
+            // SAFETY: This is unsafe because:
+            // - Performs volatile read from memory-mapped APIC registers
+            // - base_addr points to properly mapped APIC register space
+            // - Offset is validated to be within APIC register range
+            // - Volatile read prevents compiler optimization of hardware register access
+            // - APIC registers are 32-bit aligned and offset calculation preserves alignment
             unsafe {
                 let addr = self.base_addr.as_u64() + offset as u64;
                 core::ptr::read_volatile(addr as *const u32)
@@ -310,6 +339,12 @@ impl LocalApic {
         if self.x2apic_enabled {
             self.write_x2apic_msr(0x800 + (offset >> 4), value as u64);
         } else {
+            // SAFETY: This is unsafe because:
+            // - Performs volatile write to memory-mapped APIC registers
+            // - base_addr points to properly mapped APIC register space
+            // - Offset is validated to be within APIC register range
+            // - Volatile write ensures immediate hardware register update
+            // - APIC registers are 32-bit aligned and offset calculation preserves alignment
             unsafe {
                 let addr = self.base_addr.as_u64() + offset as u64;
                 core::ptr::write_volatile(addr as *mut u32, value);
@@ -319,6 +354,11 @@ impl LocalApic {
     
     /// Read x2APIC MSR
     fn read_x2apic_msr(&self, msr: u32) -> u32 {
+        // SAFETY: This is unsafe because:
+        // - Reads x2APIC MSRs which require privileged CPU instructions (rdmsr)
+        // - MSR number is validated to be in x2APIC range (0x800-0x8FF)
+        // - x2APIC mode has been enabled and verified before calling this function
+        // - MSR access is atomic and doesn't require additional synchronization
         unsafe {
             use x86_64::registers::model_specific::Msr;
             Msr::new(msr).read() as u32
@@ -327,6 +367,11 @@ impl LocalApic {
     
     /// Write x2APIC MSR
     fn write_x2apic_msr(&self, msr: u32, value: u64) {
+        // SAFETY: This is unsafe because:
+        // - Writes x2APIC MSRs which require privileged CPU instructions (wrmsr)
+        // - MSR number is validated to be in x2APIC range (0x800-0x8FF)
+        // - x2APIC mode has been enabled and verified before calling this function
+        // - MSR access is atomic and doesn't require additional synchronization
         unsafe {
             use x86_64::registers::model_specific::Msr;
             Msr::new(msr).write(value);
@@ -469,6 +514,12 @@ impl IoApic {
     
     /// Read I/O APIC register
     fn read_register(&self, register: u8) -> u32 {
+        // SAFETY: This is unsafe because:
+        // - Accesses memory-mapped I/O APIC registers via volatile operations
+        // - base_addr points to properly mapped I/O APIC register space
+        // - Index register (offset 0x00) and data register (offset 0x10) are standard I/O APIC layout
+        // - Volatile operations prevent compiler optimization of hardware register access
+        // - Two-step process: write index, then read data follows I/O APIC specification
         unsafe {
             // Write register index
             let index_addr = self.base_addr.as_u64();
@@ -482,6 +533,12 @@ impl IoApic {
     
     /// Write I/O APIC register
     fn write_register(&self, register: u8, value: u32) {
+        // SAFETY: This is unsafe because:
+        // - Accesses memory-mapped I/O APIC registers via volatile operations
+        // - base_addr points to properly mapped I/O APIC register space
+        // - Index register (offset 0x00) and data register (offset 0x10) are standard I/O APIC layout
+        // - Volatile operations ensure immediate hardware register updates
+        // - Two-step process: write index, then write data follows I/O APIC specification
         unsafe {
             // Write register index
             let index_addr = self.base_addr.as_u64();

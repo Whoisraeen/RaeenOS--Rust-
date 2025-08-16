@@ -176,9 +176,9 @@ pub struct AddressSpace {
 }
 
 impl AddressSpace {
-    pub fn new(id: u64) -> Self {
+    pub fn new(id: u64) -> Result<Self, VmError> {
         // Allocate a new physical frame for the PML4
-        let pml4_frame = memory::allocate_frame().expect("Failed to allocate PML4 frame");
+        let pml4_frame = memory::allocate_frame().ok_or(VmError::OutOfMemory)?;
         
         // Create a new page table and map it to the allocated frame
         let page_table = Box::new(PageTable::new());
@@ -206,7 +206,7 @@ impl AddressSpace {
         // Map kernel higher-half into this address space
         address_space.map_kernel_space();
         
-        address_space
+        Ok(address_space)
     }
     
     // Map kernel higher-half into this address space
@@ -217,10 +217,20 @@ impl AddressSpace {
         memory::with_mapper(|_mapper| {
             // Map the new PML4 temporarily to copy kernel entries
             let pml4_virt = memory::phys_to_virt(self.pml4_frame.start_address());
+            // SAFETY: Safe because:
+            // 1. pml4_virt is a valid virtual address from phys_to_virt conversion
+            // 2. self.pml4_frame is a valid, allocated frame for a page table
+            // 3. The frame is properly aligned for PageTable structure
+            // 4. We have exclusive access to this new PML4 during initialization
             let new_pml4 = unsafe { &mut *(pml4_virt.as_mut_ptr::<PageTable>()) };
             
             // Get current PML4
             let current_pml4_virt = memory::phys_to_virt(current_pml4_frame.start_address());
+            // SAFETY: Safe because:
+            // 1. current_pml4_virt is a valid virtual address from phys_to_virt conversion
+            // 2. current_pml4_frame is the active CR3 frame, guaranteed to be valid
+            // 3. The frame is properly aligned for PageTable structure
+            // 4. We only read from the current PML4, no modifications
             let current_pml4 = unsafe { &*(current_pml4_virt.as_ptr::<PageTable>()) };
             
             // Copy kernel higher-half entries (entries 256-511 for kernel space)
@@ -323,6 +333,62 @@ impl AddressSpace {
         
         Err(VmError::OutOfMemory)
     }
+    
+    /// Clear all user-space mappings from this address space
+    /// Preserves kernel mappings (higher half)
+    pub fn clear_user_mappings(&mut self) -> Result<(), VmError> {
+        // Clear all user areas
+        self.areas.clear();
+        
+        // Reset user space layout
+        self.next_mmap = self.mmap_start;
+        
+        // Clear user-space page table entries (entries 0-255)
+        memory::with_mapper(|_mapper| {
+            let pml4_virt = memory::phys_to_virt(self.pml4_frame.start_address());
+            // SAFETY: Safe because:
+            // 1. pml4_virt is a valid virtual address from phys_to_virt conversion
+            // 2. self.pml4_frame is a valid, allocated frame for this address space
+            // 3. The frame is properly aligned for PageTable structure
+            // 4. We have exclusive access to this address space's PML4
+            // 5. We only clear user-space entries (0-255), preserving kernel mappings
+            let pml4 = unsafe { &mut *(pml4_virt.as_mut_ptr::<PageTable>()) };
+            
+            // Clear user-space entries (0-255), preserve kernel entries (256-511)
+            for i in 0..256 {
+                pml4[i].set_unused();
+            }
+        });
+        
+        // Flush TLB to ensure cleared mappings take effect
+        // SAFETY: Safe because we're flushing the TLB after clearing user mappings
+        // to ensure no stale translations remain in the TLB cache
+        #[allow(unused_unsafe)]
+        unsafe {
+            x86_64::instructions::tlb::flush_all();
+        }
+        
+        Ok(())
+    }
+    
+    /// Map a VmArea into this address space
+    pub fn map_area(&mut self, area: &VmArea) -> Result<(), VmError> {
+        // Check for overlaps with existing areas
+        for existing_area in self.areas.values() {
+            if area.overlaps(existing_area) {
+                return Err(VmError::AddressInUse);
+            }
+        }
+        
+        // Add the area to our tracking
+        self.areas.insert(area.start, area.clone());
+        
+        // For now, we don't need to actually map pages here
+        // Page mapping will be done on-demand during page faults
+        // or explicitly when loading ELF segments
+        
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -345,14 +411,14 @@ impl VirtualMemoryManager {
         }
     }
     
-    pub fn create_address_space(&mut self) -> u64 {
+    pub fn create_address_space(&mut self) -> Result<u64, VmError> {
         let id = self.next_as_id;
         self.next_as_id += 1;
         
-        let address_space = AddressSpace::new(id);
+        let address_space = AddressSpace::new(id)?;
         self.address_spaces.insert(id, address_space);
         
-        id
+        Ok(id)
     }
     
     pub fn destroy_address_space(&mut self, id: u64) -> Result<(), VmError> {
@@ -364,6 +430,31 @@ impl VirtualMemoryManager {
             if current_id == id {
                 self.current_as_id = None;
             }
+        }
+        
+        // Get the address space before removing it
+        if let Some(address_space) = self.address_spaces.get(&id) {
+            // Deallocate all mapped pages in all areas
+            memory::with_mapper(|mapper| {
+                for area in address_space.areas.values() {
+                    for page in area.pages() {
+                        if let Ok(frame) = mapper.translate_page(page) {
+                            // Unmap the page and deallocate the frame
+                            if let Ok((_frame, flush)) = mapper.unmap(page) {
+                                flush.ignore(); // We'll do a batch TLB flush later
+                                memory::deallocate_frame(frame);
+                            }
+                        }
+                    }
+                }
+                
+                // Flush TLB after unmapping all pages
+                x86_64::instructions::tlb::flush_all();
+            });
+            
+            // Deallocate the PML4 frame
+            let pml4_frame = address_space.pml4_frame;
+            memory::deallocate_frame(pml4_frame);
         }
         
         self.address_spaces.remove(&id);
@@ -388,13 +479,19 @@ impl VirtualMemoryManager {
             return Ok(());
         }
         
-        let address_space = self.address_spaces.get(&id).unwrap();
+        let address_space = self.address_spaces.get(&id).ok_or(VmError::InvalidAddressSpace)?;
         let new_pml4_frame = address_space.pml4_frame;
         
         self.current_as_id = Some(id);
         
         // Switch CR3 to the new address space's PML4 and flush TLB
         let (_, flags) = Cr3::read();
+        // SAFETY: Safe because:
+        // 1. new_pml4_frame is a valid PML4 frame from a verified address space
+        // 2. The PML4 contains proper kernel mappings copied during creation
+        // 3. flags are preserved from the current CR3 to maintain CPU state
+        // 4. TLB flush ensures no stale translations remain after switch
+        // 5. This is the only place where CR3 is modified for address space switching
         unsafe { 
             Cr3::write(new_pml4_frame, flags);
             // Flush entire TLB to ensure proper address space isolation
@@ -426,6 +523,14 @@ impl VirtualMemoryManager {
                         
                         // Remap with new flags
                         if let Some(frame_alloc) = memory::FRAME_ALLOC.lock().as_mut() {
+                            // SAFETY: This is unsafe because:
+                            // - `mapper.map_to` requires exclusive access to page tables
+                            // - `page` must be a valid virtual page not already mapped
+                            // - `frame` must be a valid, unused physical frame
+                            // - `flags` must be valid page table flags
+                            // - `frame_alloc` must be a valid frame allocator
+                            // - We hold the VMM lock ensuring no concurrent page table modifications
+                            // - The mapping is ignored here because we do batch TLB flushing below
                             if let Ok(mapping) = unsafe { mapper.map_to(page, frame, flags, &mut *frame_alloc) } {
                                 mapping.ignore(); // We'll do a batch TLB flush later
                             }
@@ -436,6 +541,12 @@ impl VirtualMemoryManager {
         });
         
         // Flush TLB for the affected pages
+        // SAFETY: This is unsafe because:
+        // - `invlpg` is a privileged x86 instruction that invalidates TLB entries
+        // - We must ensure the page addresses are valid virtual addresses
+        // - This is required after page table modifications to maintain TLB coherency
+        // - The inline assembly constraints are correctly specified
+        // - We're running in kernel mode with appropriate privileges
         unsafe {
             for page in Page::range_inclusive(start_page, end_page) {
                 core::arch::asm!("invlpg [{}]", in(reg) page.start_address().as_u64());
@@ -452,6 +563,13 @@ impl VirtualMemoryManager {
             let frame = PhysFrame::containing_address(phys_addr);
             let page: Page<Size4KiB> = Page::containing_address(virt_addr);
             let mut alloc = GlobalFrameAlloc;
+            // SAFETY: This is unsafe because:
+            // - `mapper.map_to` requires exclusive access to page tables
+            // - `page` must be a valid virtual page not already mapped
+            // - `frame` must be a valid physical frame
+            // - `flags` must be valid page table flags
+            // - `alloc` must be a valid frame allocator
+            // - We hold the VMM lock ensuring no concurrent modifications
             match unsafe { mapper.map_to(page, frame, flags, &mut alloc) } {
                 Ok(mapping) => { mapping.flush(); Ok(()) }
                 Err(_) => Err(VmError::MapError),
@@ -465,7 +583,12 @@ impl VirtualMemoryManager {
         memory::with_mapper(|mapper| {
             let page: Page<Size4KiB> = Page::containing_address(virt_addr);
             match mapper.unmap(page) {
-                Ok((_frame, flush)) => { flush.flush(); Ok(()) }
+                Ok((frame, flush)) => { 
+                    flush.flush(); 
+                    // Deallocate the frame after unmapping
+                    memory::deallocate_frame(frame);
+                    Ok(()) 
+                }
                 Err(_) => Err(VmError::UnmapError),
             }
         })
@@ -563,9 +686,17 @@ impl VirtualMemoryManager {
             let frame = memory::allocate_frame().ok_or(VmError::OutOfMemory)?;
             let page: Page<Size4KiB> = Page::containing_address(virt_addr);
             let mut alloc = GlobalFrameAlloc;
-            let res = unsafe { mapper.map_to(page, frame, flags, &mut alloc) }.map_err(|_| VmError::MapError)?;
-            res.flush();
-            Ok(())
+            match unsafe { mapper.map_to(page, frame, flags, &mut alloc) } {
+                Ok(res) => {
+                    res.flush();
+                    Ok(())
+                }
+                Err(_) => {
+                    // Mapping failed - deallocate the frame we allocated
+                    memory::deallocate_frame(frame);
+                    Err(VmError::MapError)
+                }
+            }
         })
     }
 
@@ -711,7 +842,7 @@ pub fn init() {
     let mut vmm = VMM.write();
     
     // Create kernel address space
-    let kernel_as_id = vmm.create_address_space();
+    let kernel_as_id = vmm.create_address_space().expect("Failed to create kernel address space");
     vmm.kernel_as_id = kernel_as_id;
     vmm.current_as_id = Some(kernel_as_id);
     
@@ -746,7 +877,7 @@ pub fn init() {
     }
 }
 
-pub fn create_address_space() -> u64 {
+pub fn create_address_space() -> Result<u64, VmError> {
     VMM.write().create_address_space()
 }
 
@@ -868,7 +999,7 @@ pub fn copy_address_space(src_id: u64) -> VmResult<u64> {
     };
     
     // Create new address space
-    let new_id = vmm.create_address_space();
+    let new_id = vmm.create_address_space()?;
     
     // Copy all areas
     if let Some(new_as) = vmm.get_address_space_mut(new_id) {
@@ -933,10 +1064,12 @@ pub fn defragment_memory(as_id: u64) -> VmResult<()> {
                 let old_page_addr = old_page + i;
                 let _new_page_addr = new_page + i;
                 
-                if let Ok(_frame) = mapper.translate_page(old_page_addr) {
-                    let _ = mapper.unmap(old_page_addr);
-                    // Note: This is a simplified implementation - proper page moving would require more complex logic
-                    // For now, we'll skip the actual remapping to avoid frame allocator access issues
+                if let Ok(frame) = mapper.translate_page(old_page_addr) {
+                    if let Ok((_frame, flush)) = mapper.unmap(old_page_addr) {
+                        flush.ignore(); // We'll do a batch TLB flush later
+                        // Deallocate the frame since we're not remapping it
+                        memory::deallocate_frame(frame);
+                    }
                 }
             }
         }
@@ -1051,8 +1184,8 @@ where
 /// Test address space isolation
 pub fn test_address_space_isolation() -> VmResult<()> {
     // Create two separate address spaces
-    let as1_id = create_address_space();
-    let as2_id = create_address_space();
+    let as1_id = create_address_space()?;
+    let as2_id = create_address_space()?;
     
     // Allocate memory in each address space at the same virtual address
     let test_addr = VirtAddr::new(0x400000); // 4MB
@@ -1130,7 +1263,7 @@ pub fn test_address_space_isolation() -> VmResult<()> {
 /// Test memory protection functionality
 pub fn test_memory_protection() -> VmResult<()> {
     // Create an address space for testing
-    let as_id = create_address_space();
+    let as_id = create_address_space()?;
     
     // Allocate a test area
     let test_addr = VirtAddr::new(0x500000); // 5MB
@@ -1152,6 +1285,12 @@ pub fn test_memory_protection() -> VmResult<()> {
     
     // Test 1: Write to writable page (should succeed)
     unsafe {
+        // SAFETY: This is unsafe because:
+        // - test_addr must be a valid, mapped virtual address
+        // - The page must be mapped with WRITABLE permissions
+        // - The address must be properly aligned for u32 access
+        // - No other code should be accessing this test memory concurrently
+        // - The mapping must remain valid during the write operation
         let ptr = test_addr.as_mut_ptr::<u32>();
         *ptr = 0x12345678; // This should work
     }
@@ -1162,6 +1301,12 @@ pub fn test_memory_protection() -> VmResult<()> {
     
     // Test 3: Verify read still works
     unsafe {
+        // SAFETY: This is unsafe because:
+        // - test_addr must be a valid, mapped virtual address
+        // - The page must be mapped with READ permissions
+        // - The address must be properly aligned for u32 access
+        // - The mapping must remain valid during the read operation
+        // - The memory content must be initialized (we wrote to it earlier)
         let ptr = test_addr.as_ptr::<u32>();
         let value = *ptr;
         if value != 0x12345678 {
@@ -1182,6 +1327,12 @@ pub fn test_memory_protection() -> VmResult<()> {
     
     // Test 6: Verify write works again
     unsafe {
+        // SAFETY: This is unsafe because:
+        // - test_addr must be a valid, mapped virtual address
+        // - The page must be mapped with READ and WRITE permissions
+        // - The address must be properly aligned for u32 access
+        // - No other code should be accessing this test memory concurrently
+        // - The mapping must remain valid during both write and read operations
         let ptr = test_addr.as_mut_ptr::<u32>();
         *ptr = 0x87654321;
         let value = *ptr;
