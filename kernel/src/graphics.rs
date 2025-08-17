@@ -2024,6 +2024,8 @@ pub fn clear_framebuffer(color: Color) -> Result<(), &'static str> {
 /// Process compositor frame for real-time compositor thread
 /// This function is called by the compositor RT thread to handle frame rendering with vsync timing
 pub fn process_compositor_frame() {
+    let frame_start = crate::time::get_timestamp_ns();
+    
     // Update window manager state
     update_window_manager();
     
@@ -2040,9 +2042,72 @@ pub fn process_compositor_frame() {
     
     // For now, we just ensure the frame is rendered
     // The render_frame() function already handles the compositor logic
+    
+    // Record compositor frame timing for jitter measurement
+    record_compositor_frame_timing(frame_start);
 }
 
+/// Compositor frame timing tracking for jitter measurement
+static COMPOSITOR_FRAME_TIMES: spin::Mutex<alloc::collections::VecDeque<u64>> = spin::Mutex::new(alloc::collections::VecDeque::new());
+static COMPOSITOR_LAST_FRAME_TIME: spin::Mutex<Option<u64>> = spin::Mutex::new(None);
 
+/// Record compositor frame timing and calculate jitter
+fn record_compositor_frame_timing(frame_start: u64) {
+    let mut last_frame_time = COMPOSITOR_LAST_FRAME_TIME.lock();
+    
+    if let Some(last_time) = *last_frame_time {
+        // Calculate frame interval (time between frame starts)
+        let frame_interval = frame_start - last_time;
+        
+        // Store frame intervals for jitter calculation
+        let mut frame_times = COMPOSITOR_FRAME_TIMES.lock();
+        frame_times.push_back(frame_interval);
+        
+        // Keep only the last 100 frame intervals for measurement
+        if frame_times.len() > 100 {
+            frame_times.pop_front();
+        }
+        
+        // Calculate jitter when we have enough samples
+        if frame_times.len() >= 100 {
+            let intervals: alloc::vec::Vec<u64> = frame_times.iter().copied().collect();
+            
+            // Jitter is the deviation from expected frame interval
+            // For 120Hz, expected interval is ~8.33ms (8333333 ns)
+            // For 60Hz, expected interval is ~16.67ms (16666667 ns)
+            let expected_interval_120hz = 8333333u64; // 120Hz target
+            let jitter_values: alloc::vec::Vec<u64> = intervals.iter()
+                .map(|&interval| {
+                    if interval > expected_interval_120hz {
+                        interval - expected_interval_120hz
+                    } else {
+                        expected_interval_120hz - interval
+                    }
+                })
+                .collect();
+            
+            // Record compositor jitter measurement using SLO system
+            let jitter_values_f64: alloc::vec::Vec<f64> = jitter_values.iter()
+                .map(|&jitter| (jitter / 1000) as f64) // Convert to microseconds
+                .collect();
+            
+            crate::slo::with_slo_harness(|harness| {
+                crate::slo_measure!(harness, 
+                    crate::slo::SloCategory::CompositorJitter, 
+                    "compositor_frame_jitter", 
+                    "microseconds", 
+                    jitter_values_f64.len() as u64, 
+                    jitter_values_f64
+                );
+            });
+            
+            // Clear the buffer to start fresh measurement
+            frame_times.clear();
+        }
+    }
+    
+    *last_frame_time = Some(frame_start);
+}
 
 pub fn blit_buffer(src_data: &[u8], dst_x: u32, dst_y: u32, width: u32, height: u32, stride: u32) -> Result<(), &'static str> {
     let mut compositor = FRAMEBUFFER_COMPOSITOR.lock();

@@ -419,7 +419,7 @@ fn read_config_byte(bus: u8, device: u8, function: u8, offset: u8) -> u8 {
 }
 
 /// Read a word from PCI configuration space
-fn read_config_word(bus: u8, device: u8, function: u8, offset: u8) -> u16 {
+pub fn read_config_word(bus: u8, device: u8, function: u8, offset: u8) -> u16 {
     let address = 0x80000000u32
         | ((bus as u32) << 16)
         | ((device as u32) << 11)
@@ -437,7 +437,7 @@ fn read_config_word(bus: u8, device: u8, function: u8, offset: u8) -> u16 {
 }
 
 /// Read a dword from PCI configuration space
-fn read_config_dword(bus: u8, device: u8, function: u8, offset: u8) -> u32 {
+pub fn read_config_dword(bus: u8, device: u8, function: u8, offset: u8) -> u32 {
     let address = 0x80000000u32
         | ((bus as u32) << 16)
         | ((device as u32) << 11)
@@ -454,7 +454,7 @@ fn read_config_dword(bus: u8, device: u8, function: u8, offset: u8) -> u32 {
 }
 
 /// Write a word to PCI configuration space
-fn write_config_word(bus: u8, device: u8, function: u8, offset: u8, value: u16) {
+pub fn write_config_word(bus: u8, device: u8, function: u8, offset: u8, value: u16) {
     let address = 0x80000000u32
         | ((bus as u32) << 16)
         | ((device as u32) << 11)

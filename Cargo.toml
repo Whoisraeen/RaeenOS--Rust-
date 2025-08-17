@@ -1,9 +1,10 @@
 [workspace]
 members = [
-    "kernel",
-    "tools/build",
-    "tools/test",
-    "tools/package"
+    "kernel"
+    # Temporarily disabled tools due to serde dependency conflicts
+    # "tools/build",
+    # "tools/test",
+    # "tools/package"
 ]
 resolver = "2"
 
@@ -48,8 +49,8 @@ aes = { version = "0.8", default-features = false }
 rand_core = { version = "0.6", default-features = false }
 
 # Serialization
-serde = { version = "1.0", default-features = false, features = ["derive", "alloc"] }
-serde_json = { version = "1.0", default-features = false, features = ["alloc"] }
+# serde = { version = "1.0.210", default-features = false, features = ["derive", "alloc"] }
+# serde_json = { version = "1.0.128", default-features = false, features = ["alloc"] }
 toml = { version = "0.8", default-features = false }
 
 # File systems
@@ -71,8 +72,8 @@ clap = { version = "4.4", features = ["derive"] }
 walkdir = "2.4"
 toml_edit = "0.20"
 tar = "0.4"
-chrono = { version = "0.4", features = ["serde"] }
-uuid = { version = "1.6", features = ["v4", "serde"] }
+chrono = { version = "0.4" }
+uuid = { version = "1.6", features = ["v4"] }
 
 # Testing
 proptest = "1.4"

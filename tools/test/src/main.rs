@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::time::{Duration, Instant};
 use walkdir::WalkDir;
-use serde::{Deserialize, Serialize};
+// use serde::{Deserialize, Serialize}; // Temporarily disabled due to serde dependency conflicts
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 use criterion::{Criterion, BenchmarkId};
@@ -16,7 +16,7 @@ use mockall::predicate::*;
 mod slo;
 use slo::{SloTestRunner, SloGate};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)] // Serialize, Deserialize temporarily disabled
 struct TestConfig {
     workspace_root: PathBuf,
     build_timeout: u64,

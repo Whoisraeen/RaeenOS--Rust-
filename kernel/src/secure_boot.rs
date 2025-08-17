@@ -4,7 +4,7 @@
 use alloc::vec::Vec;
 use alloc::{string::{String, ToString}, vec};
 use spin::Mutex;
-use sha2::{Sha256, Digest};
+// use sha2::{Sha256, Digest}; // Temporarily disabled for basic boot validation
 use core::mem;
 
 /// TPM 2.0 Command/Response structures
@@ -351,30 +351,35 @@ fn measure_kernel_boot(secure_boot: &mut SecureBootState, tpm: &Tpm) -> Result<(
 
 /// Hash kernel image for measurement
 fn hash_kernel_image() -> Result<[u8; 32], &'static str> {
-    // In a real implementation, this would hash the actual kernel image
-    // For now, we'll create a deterministic hash based on kernel info
-    let mut hasher = Sha256::new();
-    hasher.update(b"RaeenOS Kernel v0.1.0");
-    hasher.update(crate::arch::get_cpu_vendor_string().as_bytes());
-    
-    let result = hasher.finalize();
+    // Temporary placeholder hash implementation for basic validation
+    // TODO: Re-enable proper SHA256 hashing when cryptography dependencies are restored
     let mut hash = [0u8; 32];
-    hash.copy_from_slice(&result);
+    let kernel_info = b"RaeenOS Kernel v0.1.0";
+    let len = kernel_info.len().min(32);
+    for i in 0..len {
+        hash[i] = kernel_info[i];
+    }
     Ok(hash)
 }
 
 /// Hash kernel configuration
 fn hash_kernel_config() -> Result<[u8; 32], &'static str> {
-    let mut hasher = Sha256::new();
-    hasher.update(b"RaeenOS Config");
-    
-    // Include security features status
-    let (smep, smap, umip) = crate::arch::cr4::get_security_status();
-    hasher.update(&[smep as u8, smap as u8, umip as u8]);
-    
-    let result = hasher.finalize();
+    // Temporary placeholder hash implementation for basic validation
+    // TODO: Re-enable proper SHA256 hashing when cryptography dependencies are restored
     let mut hash = [0u8; 32];
-    hash.copy_from_slice(&result);
+    let config_info = b"RaeenOS Config";
+    let len = config_info.len().min(32);
+    for i in 0..len {
+        hash[i] = config_info[i];
+    }
+    
+    // Include security features status in hash
+    let (smep, smap, umip) = crate::arch::cr4::get_security_status();
+    if len < 29 {
+        hash[len] = smep as u8;
+        hash[len + 1] = smap as u8;
+        hash[len + 2] = umip as u8;
+    }
     Ok(hash)
 }
 

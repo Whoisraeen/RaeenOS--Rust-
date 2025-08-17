@@ -14,9 +14,8 @@ use spin::Mutex;
 use lazy_static::lazy_static;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use core::fmt::Debug;
-// TODO: Re-enable when capabilities module is properly integrated
-// use crate::capabilities::{CapabilityType, check_capability};
-// use crate::process::ProcessId;
+use crate::capabilities::{CapabilityType, check_capability, Handle as CapabilityHandle};
+use crate::process::ProcessId;
 
 // IPC error types
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -516,12 +515,65 @@ impl AuditLog {
 }
 
 // IPC object wrapper
-#[derive(Debug)]
+// Capability endpoint for secure IPC communication
+#[derive(Debug, Clone)]
+pub struct CapabilityEndpoint {
+    pub endpoint_id: u64,
+    pub service_name: String,
+    pub process_id: u32,
+    pub capabilities: Vec<String>,
+    pub message_queue: u32, // Handle to underlying message queue
+    pub max_message_size: usize,
+    pub created_at: u64,
+}
+
+impl CapabilityEndpoint {
+    pub fn new(endpoint_id: u64, service_name: String, process_id: u32, message_queue: u32) -> Self {
+        Self {
+            endpoint_id,
+            service_name,
+            process_id,
+            capabilities: Vec::new(),
+            message_queue,
+            max_message_size: 4096,
+            created_at: crate::time::get_uptime_ms(),
+        }
+    }
+    
+    pub fn add_capability(&mut self, capability: String) {
+        if !self.capabilities.contains(&capability) {
+            self.capabilities.push(capability);
+        }
+    }
+    
+    pub fn has_capability(&self, capability: &str) -> bool {
+        self.capabilities.iter().any(|c| c == capability)
+    }
+    
+    pub fn send_message(&self, message: &[u8]) -> Result<(), IpcError> {
+        if message.len() > self.max_message_size {
+            return Err(IpcError::InvalidSize);
+        }
+        
+        // Send through underlying message queue
+        let mut ipc = IPC_SYSTEM.lock();
+        ipc.write_to_object(self.process_id, self.message_queue, message)
+            .map(|_| ())
+    }
+    
+    pub fn receive_message(&self, buffer: &mut [u8]) -> Result<usize, IpcError> {
+        // Receive from underlying message queue
+        let mut ipc = IPC_SYSTEM.lock();
+        ipc.read_from_object(self.process_id, self.message_queue, buffer)
+    }
+}
+
 enum IpcObject {
     Pipe(Pipe),
     MessageQueue(MessageQueue),
     SharedMemory(SharedMemory),
     MpscRing(MpscRing),
+    CapabilityEndpoint(CapabilityEndpoint),
 }
 
 // Enhanced file descriptor with capability-based rights
@@ -670,12 +722,11 @@ impl IpcSystem {
     }
     
     /// Validate that a process has the required capability for an IPC operation
-    fn validate_capability(&self, _process_id: u32, capability: &str) -> Result<(), IpcError> {
-        // For now, we'll implement a simple check that allows all IPC operations
-        // TODO: Integrate with proper capability system once handle-based validation is implemented
-        match capability {
-            "ipc_create" | "ipc_connect" | "ipc_send" | "ipc_receive" => Ok(()),
-            _ => Err(IpcError::CapabilityRequired),
+    fn validate_capability(&self, process_id: u32, capability_handle: CapabilityHandle, capability_type: CapabilityType, permissions: u64) -> Result<(), IpcError> {
+        match check_capability(process_id as ProcessId, capability_handle, capability_type, permissions) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(IpcError::PermissionDenied),
+            Err(_) => Err(IpcError::CapabilityRequired),
         }
     }
     
@@ -818,11 +869,11 @@ impl IpcSystem {
         }
     }
     
-    fn create_mpsc_ring(&mut self, process_id: u32, capacity: usize, 
+    fn create_mpsc_ring(&mut self, process_id: u32, capability_handle: CapabilityHandle, capacity: usize, 
                        policy: BackpressurePolicy, rights: IpcRights,
                        expiry_time: Option<u64>, label: Option<String>) -> Result<u32, IpcError> {
         // Validate capability to create IPC objects
-        self.validate_capability(process_id, "ipc_create")?;
+        self.validate_capability(process_id, capability_handle, CapabilityType::IpcCreate, 0x01)?;
         
         if capacity == 0 || capacity > 65536 {
             return Err(IpcError::InvalidSize);
@@ -1257,6 +1308,9 @@ pub fn ipc_read(fd: u32, buf: &mut [u8]) -> Result<usize, ()> {
         }
         IpcObject::SharedMemory(_) => Err(()), // Use attach/detach for shared memory
         IpcObject::MpscRing(_) => Err(()), // Use receive_from_ring for MPSC rings
+        IpcObject::CapabilityEndpoint(endpoint) => {
+            endpoint.receive_message(buf).map_err(|_| ())
+        }
     }
 }
 
@@ -1285,6 +1339,10 @@ pub fn ipc_write(fd: u32, buf: &[u8]) -> Result<usize, ()> {
         }
         IpcObject::SharedMemory(_) => Err(()), // Use attach/detach for shared memory
         IpcObject::MpscRing(_) => Err(()), // Use send_to_ring for MPSC rings
+        IpcObject::CapabilityEndpoint(endpoint) => {
+            endpoint.send_message(buf).map_err(|_| ())?;
+            Ok(buf.len())
+        }
     }
 }
 
@@ -1325,6 +1383,85 @@ pub fn close_ipc_fd(fd: u32) -> Result<(), ()> {
     }
     
     Ok(())
+}
+
+/// Create a capability endpoint for secure service communication
+pub fn create_capability_endpoint(
+    service_name: String,
+    process_id: u32,
+    capabilities: Vec<String>,
+) -> Result<u32, IpcError> {
+    let mut ipc = IPC_SYSTEM.lock();
+    
+    // Create underlying message queue for the endpoint
+    let queue_id = ipc.next_ipc_id;
+    ipc.next_ipc_id += 1;
+    
+    let queue = MessageQueue::new(100, 4096); // 100 messages, 4KB each
+    ipc.objects.insert(queue_id, IpcObject::MessageQueue(queue));
+    
+    // Create the capability endpoint
+    let endpoint_id = ipc.next_ipc_id;
+    ipc.next_ipc_id += 1;
+    
+    let mut endpoint = CapabilityEndpoint::new(
+        endpoint_id as u64,
+        service_name.clone(),
+        process_id,
+        queue_id,
+    );
+    
+    // Add capabilities
+    for capability in capabilities {
+        endpoint.add_capability(capability);
+    }
+    
+    ipc.objects.insert(endpoint_id, IpcObject::CapabilityEndpoint(endpoint));
+    
+    // Create handle in process handle table
+    let handle_table = ipc.get_or_create_handle_table(process_id);
+    let handle_id = handle_table.allocate_handle(
+        endpoint_id,
+        IpcObjectType::CapabilityEndpoint,
+        IpcRights::SEND_RECV,
+        None,
+        Some(service_name.clone()),
+    );
+    
+    // Log the operation
+    let _ = ipc.audit_log.log(
+        process_id,
+        "create_capability_endpoint".to_string(),
+        endpoint_id,
+        "success".to_string(),
+        format!("service={}, handle={}", service_name, handle_id),
+    );
+    
+    Ok(handle_id)
+}
+
+/// Get capability endpoint by handle
+pub fn get_capability_endpoint(process_id: u32, handle_id: u32) -> Result<CapabilityEndpoint, IpcError> {
+    let ipc = IPC_SYSTEM.lock();
+    
+    let handle_table = ipc.handle_tables.get(&process_id)
+        .ok_or(IpcError::InvalidHandle)?;
+    
+    let handle = handle_table.get_handle(handle_id)
+        .ok_or(IpcError::InvalidHandle)?;
+    
+    if handle.object_type != IpcObjectType::CapabilityEndpoint {
+        return Err(IpcError::InvalidHandle);
+    }
+    
+    let object = ipc.objects.get(&handle.object_id)
+        .ok_or(IpcError::ObjectNotFound)?;
+    
+    if let IpcObject::CapabilityEndpoint(endpoint) = object {
+        Ok(endpoint.clone())
+    } else {
+        Err(IpcError::InvalidHandle)
+    }
 }
 
 // Attach to shared memory
@@ -1398,10 +1535,11 @@ pub fn cleanup_process_ipc(process_id: u32) {
 }
 
 // Create an MPSC ring with flow control
-pub fn create_mpsc_ring(process_id: u32, capacity: usize, policy: BackpressurePolicy) -> Result<u32, IpcError> {
+pub fn create_mpsc_ring(process_id: u32, capability_handle: CapabilityHandle, capacity: usize, policy: BackpressurePolicy) -> Result<u32, IpcError> {
     let mut ipc = IPC_SYSTEM.lock();
     ipc.create_mpsc_ring(
-        process_id, 
+        process_id,
+        capability_handle,
         capacity, 
         policy, 
         IpcRights::SEND_RECV, 
@@ -1480,32 +1618,108 @@ pub fn delegate_handle(from_process: u32, to_process: u32, handle_id: u32,
 }
 
 /// Create a pipe with enhanced capability validation
-pub fn create_pipe_with_capabilities(_process_id: u32, _buffer_size: usize) -> Result<(u32, u32), IpcError> {
-    // TODO: Add proper capability validation
-    create_pipe().map_err(|_| IpcError::CreationFailed)
+pub fn create_pipe_with_capabilities(process_id: u32, capability_handle: CapabilityHandle, buffer_size: usize) -> Result<(u32, u32), IpcError> {
+    let mut system = IPC_SYSTEM.lock();
+    
+    // Validate IPC creation capability
+    system.validate_capability(process_id, capability_handle, CapabilityType::IpcCreate, 0x01)?;
+    
+    let pipe_id = system.next_ipc_id;
+    system.next_ipc_id += 1;
+    
+    let pipe = Pipe::new(buffer_size);
+    system.objects.insert(pipe_id, IpcObject::Pipe(pipe));
+    
+    let handle_table = system.get_or_create_handle_table(process_id);
+    
+    let read_handle = handle_table.allocate_handle(
+        pipe_id,
+        IpcObjectType::Pipe,
+        IpcRights::READ_WRITE,
+        None,
+        None,
+    );
+    
+    let write_handle = handle_table.allocate_handle(
+        pipe_id,
+        IpcObjectType::Pipe,
+        IpcRights::READ_WRITE,
+        None,
+        None,
+    );
+    
+    Ok((read_handle, write_handle))
 }
 
 /// Create a message queue with enhanced capability validation
-pub fn create_message_queue_with_capabilities(_process_id: u32, max_messages: usize) -> Result<u32, IpcError> {
-    // TODO: Add proper capability validation
-    create_message_queue(max_messages, 1024).map_err(|_| IpcError::CreationFailed)
+pub fn create_message_queue_with_capabilities(process_id: u32, capability_handle: CapabilityHandle, max_messages: usize, max_message_size: usize) -> Result<u32, IpcError> {
+    let mut system = IPC_SYSTEM.lock();
+    
+    // Validate IPC creation capability
+    system.validate_capability(process_id, capability_handle, CapabilityType::IpcCreate, 0x01)?;
+    
+    let queue_id = system.next_ipc_id;
+    system.next_ipc_id += 1;
+    
+    let queue = MessageQueue::new(max_messages, max_message_size);
+    system.objects.insert(queue_id, IpcObject::MessageQueue(queue));
+    
+    let handle_table = system.get_or_create_handle_table(process_id);
+    
+    let handle = handle_table.allocate_handle(
+        queue_id,
+        IpcObjectType::MessageQueue,
+        IpcRights::SEND_RECV,
+        None,
+        None,
+    );
+    
+    Ok(handle)
 }
 
 /// Create shared memory with enhanced capability validation
-pub fn create_shared_memory_with_capabilities(_process_id: u32, size: usize) -> Result<u32, IpcError> {
-    // TODO: Add proper capability validation
-    create_shared_memory(size).map_err(|_| IpcError::CreationFailed)
+pub fn create_shared_memory_with_capabilities(process_id: u32, capability_handle: CapabilityHandle, size: usize) -> Result<u32, IpcError> {
+    let mut system = IPC_SYSTEM.lock();
+    
+    // Validate memory mapping capability
+    system.validate_capability(process_id, capability_handle, CapabilityType::MemoryShared, 0x01)?;
+    
+    let shm_id = system.next_ipc_id;
+    system.next_ipc_id += 1;
+    
+    let shm = SharedMemory::new(size);
+    system.objects.insert(shm_id, IpcObject::SharedMemory(shm));
+    
+    let handle_table = system.get_or_create_handle_table(process_id);
+    
+    let handle = handle_table.allocate_handle(
+        shm_id,
+        IpcObjectType::SharedMemory,
+        IpcRights { read: true, write: true, map: true, ..IpcRights::NONE },
+        None,
+        None,
+    );
+    
+    Ok(handle)
 }
 
 /// Read from IPC object with capability validation
 pub fn read_from_ipc_object(process_id: u32, handle_id: u32, buffer: &mut [u8]) -> Result<usize, IpcError> {
     let mut ipc = IPC_SYSTEM.lock();
+    
+    // Validate handle rights for reading
+    ipc.validate_handle_rights(process_id, handle_id, IpcRights { read: true, ..IpcRights::NONE })?;
+    
     ipc.read_from_object(process_id, handle_id, buffer)
 }
 
 /// Write to IPC object with capability validation
 pub fn write_to_ipc_object(process_id: u32, handle_id: u32, data: &[u8]) -> Result<usize, IpcError> {
     let mut ipc = IPC_SYSTEM.lock();
+    
+    // Validate handle rights for writing
+    ipc.validate_handle_rights(process_id, handle_id, IpcRights { write: true, ..IpcRights::NONE })?;
+    
     ipc.write_to_object(process_id, handle_id, data)
 }
 
@@ -1538,6 +1752,7 @@ pub fn inspect_handle_metadata(process_id: u32, handle_id: u32) -> Result<Handle
             IpcObject::MessageQueue(_) => "message_queue",
             IpcObject::SharedMemory(_) => "shared_memory",
             IpcObject::MpscRing(_) => "mpsc_ring",
+            IpcObject::CapabilityEndpoint(_) => "capability_endpoint",
         })
         .unwrap_or("unknown");
     

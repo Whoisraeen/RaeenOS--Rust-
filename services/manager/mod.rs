@@ -125,11 +125,16 @@ impl ServiceManager {
     ) -> Result<u32, ServiceError> {
         let service_id = NEXT_SERVICE_ID.fetch_add(1, Ordering::SeqCst);
         
-        // Create IPC endpoint for the service
-        let endpoint = CapabilityEndpoint::new(
-            format!("service_{}", service_id),
-            IpcRights::READ | IpcRights::WRITE,
+        // Create IPC endpoint for the service using capability system
+        let endpoint_handle = crate::ipc::create_capability_endpoint(
+            info.name.clone(),
+            process_id,
+            info.capabilities.clone(),
         ).map_err(|_| ServiceError::EndpointCreationFailed)?;
+        
+        // Get the endpoint object
+        let endpoint = crate::ipc::get_capability_endpoint(process_id, endpoint_handle)
+            .map_err(|_| ServiceError::EndpointCreationFailed)?;
         
         // Register with service registry
         self.registry.register(service_id, info.clone(), config.clone())?;

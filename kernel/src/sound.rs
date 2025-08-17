@@ -4,6 +4,7 @@
 use x86_64::instructions::port::Port;
 use spin::Mutex;
 use lazy_static::lazy_static;
+use alloc::string::ToString;
 
 // PC Speaker ports
 const PIT_CHANNEL_2: u16 = 0x42;
@@ -128,6 +129,8 @@ pub fn get_status() -> (bool, u32) {
 /// Process audio buffers for real-time audio thread
 /// This function is called by the audio RT thread to handle low-latency audio processing
 pub fn process_audio_buffers() {
+    let buffer_start = crate::time::get_timestamp_ns();
+    
     // For now, this is a placeholder for real audio buffer processing
     // In a full implementation, this would:
     // 1. Check for pending audio data in input/output buffers
@@ -142,7 +145,73 @@ pub fn process_audio_buffers() {
         // This could include checking for buffer underruns,
         // updating audio device state, etc.
     }
+    drop(sound);
+    
+    // Record audio buffer timing for jitter measurement
+    record_audio_buffer_timing(buffer_start);
     
     // For now, just yield to maintain RT thread timing
     // In a real implementation, this would process actual audio buffers
+}
+
+/// Audio buffer timing tracking for jitter measurement
+static AUDIO_BUFFER_TIMES: spin::Mutex<alloc::collections::VecDeque<u64>> = spin::Mutex::new(alloc::collections::VecDeque::new());
+static AUDIO_LAST_BUFFER_TIME: spin::Mutex<Option<u64>> = spin::Mutex::new(None);
+
+/// Record audio buffer timing and calculate jitter
+fn record_audio_buffer_timing(buffer_start: u64) {
+    let mut last_buffer_time = AUDIO_LAST_BUFFER_TIME.lock();
+    
+    if let Some(last_time) = *last_buffer_time {
+        // Calculate buffer interval (time between buffer starts)
+        let buffer_interval = buffer_start - last_time;
+        
+        // Store buffer intervals for jitter calculation
+        let mut buffer_times = AUDIO_BUFFER_TIMES.lock();
+        buffer_times.push_back(buffer_interval);
+        
+        // Keep only the last 100 buffer intervals for measurement
+        if buffer_times.len() > 100 {
+            buffer_times.pop_front();
+        }
+        
+        // Calculate jitter when we have enough samples
+        if buffer_times.len() >= 100 {
+            let intervals: alloc::vec::Vec<u64> = buffer_times.iter().copied().collect();
+            
+            // Audio jitter is the deviation from expected buffer interval
+            // For 48kHz with 128 samples, expected interval is ~2.67ms (2670000 ns)
+            // For 44.1kHz with 128 samples, expected interval is ~2.9ms (2900000 ns)
+            let expected_interval_48khz = 2670000u64; // 2.67ms for 128 samples at 48kHz
+            let jitter_values: alloc::vec::Vec<u64> = intervals.iter()
+                .map(|&interval| {
+                    if interval > expected_interval_48khz {
+                        interval - expected_interval_48khz
+                    } else {
+                        expected_interval_48khz - interval
+                    }
+                })
+                .collect();
+            
+            // Record audio jitter measurement using SLO system
+            let jitter_values_f64: alloc::vec::Vec<f64> = jitter_values.iter()
+                .map(|&jitter| (jitter / 1000) as f64) // Convert to microseconds
+                .collect();
+            
+            crate::slo::with_slo_harness(|harness| {
+                crate::slo_measure!(harness, 
+                    crate::slo::SloCategory::AudioUnderruns, 
+                    "audio_buffer_jitter", 
+                    "microseconds", 
+                    jitter_values_f64.len() as u64, 
+                    jitter_values_f64
+                );
+            });
+            
+            // Clear the buffer to start fresh measurement
+            buffer_times.clear();
+        }
+    }
+    
+    *last_buffer_time = Some(buffer_start);
 }

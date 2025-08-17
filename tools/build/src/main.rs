@@ -6,11 +6,12 @@ use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use walkdir::WalkDir;
 use toml_edit::Document;
-use serde::{Deserialize, Serialize};
+// use serde::{Deserialize, Serialize}; // Temporarily disabled due to serde dependency conflicts
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+// #[derive(Debug, Clone, Serialize, Deserialize)] // Temporarily disabled due to serde dependency conflicts
+#[derive(Debug, Clone)]
 struct BuildConfig {
     kernel_target: String,
     userspace_target: String,

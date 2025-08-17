@@ -5,7 +5,7 @@ use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use alloc::string::String;
 use core::sync::atomic::{AtomicU64, Ordering};
-use spin::{Mutex, RwLock};
+use spin::RwLock;
 use lazy_static::lazy_static;
 use crate::process::ProcessId;
 
@@ -97,7 +97,7 @@ struct HandleEntry {
 /// Per-process handle table
 #[derive(Debug)]
 struct HandleTable {
-    process_id: ProcessId,
+    _process_id: ProcessId,
     handles: BTreeMap<Handle, HandleEntry>,
     next_handle: Handle,
 }
@@ -105,7 +105,7 @@ struct HandleTable {
 impl HandleTable {
     fn new(process_id: ProcessId) -> Self {
         Self {
-            process_id,
+            _process_id: process_id,
             handles: BTreeMap::new(),
             next_handle: 1, // Start from 1, 0 is invalid
         }
@@ -345,14 +345,23 @@ pub fn list_process_capabilities(process_id: ProcessId) -> Vec<(Handle, Capabili
     let mut system = CAPABILITY_SYSTEM.write();
     let mut result = Vec::new();
     
-    if let Some(handle_table) = system.handle_tables.get_mut(&process_id) {
-        for handle in handle_table.list_handles() {
-            if let Some(capability_id) = handle_table.get_capability(handle) {
-                if let Some(capability) = system.capabilities.get(&capability_id) {
-                    if !capability.revoked {
-                        result.push((handle, capability.capability_type, capability.permissions));
-                    }
-                }
+    // First collect all handles and their capability IDs
+    let handle_capability_pairs: Vec<(Handle, CapabilityId)> = if let Some(handle_table) = system.handle_tables.get_mut(&process_id) {
+        let handles = handle_table.list_handles();
+        handles.into_iter()
+            .filter_map(|handle| {
+                handle_table.get_capability(handle).map(|cap_id| (handle, cap_id))
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    
+    // Then look up capabilities without borrowing handle_table
+    for (handle, capability_id) in handle_capability_pairs {
+        if let Some(capability) = system.capabilities.get(&capability_id) {
+            if !capability.revoked {
+                result.push((handle, capability.capability_type, capability.permissions));
             }
         }
     }

@@ -208,13 +208,13 @@ impl IpcRouter {
         let serialized = bincode::serialize(message)
             .map_err(|_| RouterError::SerializationFailed)?;
         
-        // Send through IPC endpoint
-        route.endpoint.send(&serialized)
+        // Send through capability endpoint using IPC system
+        route.endpoint.send_message(&serialized)
             .map_err(|_| RouterError::TransmissionFailed)?;
         
         // Wait for response if expected
         if message.reply_expected {
-            let response_data = route.endpoint.receive()
+            let response_data = route.endpoint.receive_message()
                 .map_err(|_| RouterError::ReceiveFailed)?;
             
             // Deserialize response

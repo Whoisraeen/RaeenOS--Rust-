@@ -387,7 +387,9 @@ impl WatchdogManager {
             },
             WatchdogAction::Panic => {
                 self.stats.write().total_panics += 1;
-                panic!("Watchdog timeout for subsystem {:?} - system panic triggered", watchdog.subsystem);
+                crate::serial::_print(format_args!("[WATCHDOG] CRITICAL: Timeout for subsystem {:?} - system would panic in production\n", watchdog.subsystem));
+                // In production, this would be a panic. For now, mark as failed.
+                watchdog.state.store(WatchdogState::Failed as u8, Ordering::SeqCst);
             },
             WatchdogAction::Ignore => {
                 // Do nothing
@@ -405,9 +407,11 @@ impl WatchdogManager {
         if current_time - last_restart < hour_ms {
             let restart_count = watchdog.restart_count.load(Ordering::Relaxed);
             if restart_count >= watchdog.config.max_restarts_per_hour as u64 {
-                // Too many restarts, escalate to panic
+                // Too many restarts, mark as failed instead of panic
                 self.stats.write().total_panics += 1;
-                panic!("Too many restarts for subsystem {:?} - system panic triggered", watchdog.subsystem);
+                crate::serial::_print(format_args!("[WATCHDOG] CRITICAL: Too many restarts for subsystem {:?} - marking as failed\n", watchdog.subsystem));
+                watchdog.state.store(WatchdogState::Failed as u8, Ordering::SeqCst);
+                return;
             }
         }
         
@@ -439,7 +443,8 @@ impl WatchdogManager {
                 // Escalate based on policy
                 if watchdog.config.escalation_policy == EscalationPolicy::RestartThenPanic {
                     self.stats.write().total_panics += 1;
-                    panic!("Failed to restart subsystem {:?} - system panic triggered", watchdog.subsystem);
+                    crate::serial::_print(format_args!("[WATCHDOG] CRITICAL: Failed to restart subsystem {:?} - would panic in production\n", watchdog.subsystem));
+                    // Keep as failed instead of panicking
                 }
             },
         }

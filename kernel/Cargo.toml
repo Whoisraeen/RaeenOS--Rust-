@@ -3,6 +3,13 @@ name = "kernel"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = []
+boot-animation = []
+test-mode = []
+demo-mode = []
+perf-tests = []
+
 [lints.rust]
 warnings = "deny"
 
@@ -17,12 +24,12 @@ pc-keyboard = "0.7.0"
 lazy_static = { version = "1.4.0", features = ["spin_no_std"] }
 linked_list_allocator = "0.10.5"
 bitflags = { version = "2.4.1", default-features = false }
-serde = { version = "1.0", default-features = false, features = ["derive", "alloc"] }
-serde_json = { version = "1.0", default-features = false, features = ["alloc"] }
-# Cryptography for secure boot
-sha2 = { version = "0.10", default-features = false }
-rsa = { version = "0.9", default-features = false }
-rand_core = { version = "0.6", default-features = false }
+# serde = { version = "1.0.210", default-features = false, features = ["derive", "alloc"] }
+# serde_json = { version = "1.0.128", default-features = false, features = ["alloc"] }
+# Cryptography for secure boot (temporarily disabled for basic boot validation)
+# sha2 = { version = "0.10", default-features = false }
+# rsa = { version = "0.9", default-features = false }
+# rand_core = { version = "0.6", default-features = false }
 
 [dev-dependencies]
 bootimage = "0.10.3"

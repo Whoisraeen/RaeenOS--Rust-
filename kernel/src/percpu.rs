@@ -13,6 +13,10 @@ use crate::process::ProcessId;
 /// Maximum number of CPUs supported
 const MAX_CPUS: usize = 256;
 
+/// MSR definitions for GS base setup
+const IA32_GS_BASE: u32 = 0xC0000101;
+const IA32_KERNEL_GS_BASE: u32 = 0xC0000102;
+
 /// Per-CPU data structure
 #[repr(C, align(64))] // Cache line aligned to prevent false sharing
 #[derive(Debug)]
@@ -87,6 +91,12 @@ pub struct PerCpuData {
     
     /// IRQ stack pointer
     pub irq_stack: AtomicU64,
+    
+    /// User stack pointer (stored at gs:[0x10] during syscalls)
+    pub user_stack: AtomicU64,
+    
+    /// Saved user GS base for TLS support
+    pub user_gs_base: AtomicU64,
 }
 
 /// CPU feature flags
@@ -162,6 +172,8 @@ impl PerCpuData {
             kernel_stack: AtomicU64::new(0),
             exception_stack: AtomicU64::new(0),
             irq_stack: AtomicU64::new(0),
+            user_stack: AtomicU64::new(0),
+            user_gs_base: AtomicU64::new(0),
         }
     }
     
@@ -256,6 +268,36 @@ impl PerCpuData {
     }
     
     /// Get statistics summary
+    /// Set kernel stack pointer
+    pub fn set_kernel_stack(&self, stack: u64) {
+        self.kernel_stack.store(stack, Ordering::SeqCst);
+    }
+    
+    /// Get kernel stack pointer
+    pub fn get_kernel_stack(&self) -> u64 {
+        self.kernel_stack.load(Ordering::SeqCst)
+    }
+    
+    /// Set user stack pointer (for syscall entry/exit)
+    pub fn set_user_stack(&self, stack: u64) {
+        self.user_stack.store(stack, Ordering::SeqCst);
+    }
+    
+    /// Get user stack pointer
+    pub fn get_user_stack(&self) -> u64 {
+        self.user_stack.load(Ordering::SeqCst)
+    }
+    
+    /// Set user GS base (for TLS support)
+    pub fn set_user_gs_base(&self, base: u64) {
+        self.user_gs_base.store(base, Ordering::SeqCst);
+    }
+    
+    /// Get user GS base
+    pub fn get_user_gs_base(&self) -> u64 {
+        self.user_gs_base.load(Ordering::SeqCst)
+    }
+    
     pub fn get_stats(&self) -> CpuStats {
         CpuStats {
             cpu_id: self.cpu_id,
@@ -349,6 +391,9 @@ pub fn init() -> Result<(), &'static str> {
     
     unsafe {
         PER_CPU_DATA[0] = Some(bsp_data);
+        
+        // Setup GS base to point to this CPU's data
+        setup_gs_base(0)?;
     }
     
     CPU_COUNT.store(1, Ordering::SeqCst);
@@ -387,12 +432,15 @@ pub fn add_cpu(cpu_id: u32, apic_id: u32) -> Result<(), &'static str> {
         }
         
         PER_CPU_DATA[cpu_id as usize] = Some(cpu_data);
+        
+        // Setup GS base for this CPU
+        setup_gs_base(cpu_id)?;
     }
     
     CPU_COUNT.fetch_add(1, Ordering::SeqCst);
     
     crate::serial::_print(format_args!(
-        "[PerCPU] Added CPU {} (APIC ID {})\n",
+        "[PerCPU] Added CPU {} (APIC ID {}) with GS base\n",
         cpu_id, apic_id
     ));
     
@@ -502,6 +550,37 @@ pub fn add_cpu_time(user_ticks: u64, kernel_ticks: u64, idle_ticks: u64) {
         cpu_data.add_kernel_ticks(kernel_ticks);
         cpu_data.add_idle_ticks(idle_ticks);
     }
+}
+
+/// Setup GS base for a specific CPU
+unsafe fn setup_gs_base(cpu_id: u32) -> Result<(), &'static str> {
+    if let Some(cpu_data) = PER_CPU_DATA[cpu_id as usize].as_ref() {
+        let cpu_data_ptr = cpu_data as *const PerCpuData as u64;
+        
+        // Set IA32_GS_BASE to point to this CPU's per-CPU data
+        use x86_64::registers::model_specific::Msr;
+        let mut gs_base_msr = Msr::new(IA32_GS_BASE);
+        gs_base_msr.write(cpu_data_ptr);
+        
+        // Initialize IA32_KERNEL_GS_BASE to 0 (will be set per-process if needed)
+        let mut kernel_gs_base_msr = Msr::new(IA32_KERNEL_GS_BASE);
+        kernel_gs_base_msr.write(0);
+        
+        crate::serial::_print(format_args!(
+            "[PerCPU] GS base setup for CPU {} at 0x{:x}\n",
+            cpu_id, cpu_data_ptr
+        ));
+        
+        Ok(())
+    } else {
+        Err("CPU data not found")
+    }
+}
+
+/// Setup GS base for current CPU (called during AP bring-up)
+pub fn setup_current_cpu_gs_base() -> Result<(), &'static str> {
+    let cpu_id = arch::get_current_cpu_id();
+    unsafe { setup_gs_base(cpu_id) }
 }
 
 /// Check if per-CPU subsystem is initialized

@@ -3,6 +3,57 @@
 
 use crate::drivers;
 use crate::graphics;
+use crate::slo::{with_slo_harness, SloCategory};
+use crate::slo_measure;
+use alloc::collections::BTreeMap;
+use alloc::vec::Vec;
+use alloc::string::ToString;
+use spin::Mutex;
+use lazy_static::lazy_static;
+
+// Input latency tracking for SLO measurements
+lazy_static! {
+    static ref INPUT_TIMESTAMPS: Mutex<BTreeMap<u8, u64>> = Mutex::new(BTreeMap::new());
+    static ref LATENCY_SAMPLES: Mutex<Vec<f64>> = Mutex::new(Vec::new());
+}
+
+/// Record timestamp when keyboard interrupt occurs
+pub fn record_input_interrupt_timestamp(scancode: u8, timestamp_ns: u64) {
+    let mut timestamps = INPUT_TIMESTAMPS.lock();
+    timestamps.insert(scancode, timestamp_ns);
+}
+
+/// Record input latency measurement when event is delivered to application
+fn record_input_latency(scancode: u8) {
+    let delivery_time = crate::time::get_timestamp_ns();
+    
+    if let Some(interrupt_time) = INPUT_TIMESTAMPS.lock().remove(&scancode) {
+        let latency_ns = delivery_time.saturating_sub(interrupt_time);
+        let latency_us = latency_ns as f64 / 1000.0; // Convert to microseconds
+        
+        // Collect samples for periodic SLO measurement
+        let mut samples = LATENCY_SAMPLES.lock();
+        samples.push(latency_us);
+        
+        // Report to SLO harness every 100 samples
+        if samples.len() >= 100 {
+            let sample_data = samples.clone();
+            samples.clear();
+            
+            // Record SLO measurement
+            with_slo_harness(|harness| {
+                slo_measure!(
+                    harness,
+                    SloCategory::InputLatency,
+                    "keyboard_interrupt_to_delivery",
+                    "microseconds",
+                    sample_data.len() as u64,
+                    sample_data
+                );
+            });
+        }
+    }
+}
 
 /// Process input events for real-time input thread
 /// This function is called by the input RT thread to handle low-latency input processing
@@ -48,6 +99,11 @@ pub fn process_input_events() {
 
 /// Enhanced keyboard event routing with focus management
 fn route_keyboard_event(key_code: u32, pressed: bool) {
+    // Record input latency measurement for pressed keys
+    if pressed {
+        record_input_latency(key_code as u8);
+    }
+    
     // Handle global hotkeys first
     if pressed {
         match key_code {

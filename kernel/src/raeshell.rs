@@ -105,6 +105,7 @@ lazy_static! {
         system.builtin_commands.insert("date".to_string(), cmd_date);
         system.builtin_commands.insert("uptime".to_string(), cmd_uptime);
         system.builtin_commands.insert("free".to_string(), cmd_free);
+        system.builtin_commands.insert("thread_stress".to_string(), cmd_thread_stress);
         
         Mutex::new(system)
     };
@@ -206,16 +207,9 @@ fn cmd_clear(_args: &[&str]) -> ShellResult {
 }
 
 fn cmd_ps(_args: &[&str]) -> ShellResult {
-    let process_count = crate::process::get_process_count();
-    let current_pid = crate::process::get_current_process_id();
-    
-    let output = format!(
-        "PID  COMMAND\n{}   raeshell\nTotal processes: {}",
-        current_pid,
-        process_count
-    );
-    
-    ShellResult::Success(output)
+    // Use kernel-provided dump for now (prints to serial)
+    let _ = crate::syscall::handle_syscall(352, 0, 0, 0, 0, 0, 0);
+    ShellResult::Success("(ps) see serial for detailed list".to_string())
 }
 
 fn cmd_kill(args: &[&str]) -> ShellResult {
@@ -417,6 +411,13 @@ fn cmd_free(_args: &[&str]) -> ShellResult {
     );
     
     ShellResult::Success(output)
+}
+
+fn cmd_thread_stress(args: &[&str]) -> ShellResult {
+    // placeholder trigger to run userspace-thread-stress once available
+    let threads = if args.len() > 1 { args[1].parse::<u64>().unwrap_or(4) } else { 4 };
+    let _ = crate::serial::_print(format_args!("[thread_stress] requested {} threads\n", threads));
+    ShellResult::Success("thread_stress: userspace binary will perform measurement".to_string())
 }
 
 // Parse command line into tokens

@@ -1,3 +1,27 @@
+fn sys_dump_process_list() -> SyscallResult {
+    // For now, print to serial; userspace can capture via serial log or later via IPC
+    let mut count = 0;
+    // Use public helper to iterate: add a minimal export in process.rs
+    match crate::process::for_each_process(|pid, name, state, prio| {
+        let state_s = match state {
+            crate::process::ProcessState::Ready => "Ready",
+            crate::process::ProcessState::Running => "Running",
+            crate::process::ProcessState::Blocked => "Blocked",
+            crate::process::ProcessState::Terminated => "Terminated",
+        };
+        let prio_s = match prio {
+            crate::process::Priority::High => "High",
+            crate::process::Priority::Normal => "Normal",
+            crate::process::Priority::Low => "Low",
+            crate::process::Priority::Gaming => "Gaming",
+        };
+        crate::serial_println!("[ps] pid={} name={} state={} prio={}", pid, name, state_s, prio_s);
+        count += 1;
+    }) {
+        Ok(()) => SyscallResult::success(count),
+        Err(_) => SyscallResult::error(SyscallError::ResourceBusy),
+    }
+}
 use alloc::vec::Vec;
 use alloc::vec;
 use alloc::format;
@@ -17,6 +41,10 @@ pub enum SyscallNumber {
     GetPpid = 6,
     Sleep = 7,
     Yield = 8,
+    // Threads (append-only, new IDs at end of table)
+    ThreadCreate = 350,
+    SetPriority = 351,
+    DumpProcessList = 352,
     
     // File operations
     Open = 10,
@@ -148,6 +176,9 @@ pub fn handle_syscall(
         6 => sys_getppid(),
         7 => sys_sleep(arg1),
         8 => sys_yield(),
+        350 => sys_thread_create(arg1, arg2),
+        351 => sys_set_priority(arg1),
+        352 => sys_dump_process_list(),
         
         // File operations
         10 => sys_open(arg1, arg2, arg3),
@@ -245,10 +276,16 @@ fn sys_fork() -> SyscallResult {
 }
 
 fn sys_exec(path: u64, args: u64) -> SyscallResult {
-    let path_str = unsafe { c_str_from_user(path) };
+    use alloc::string::String;
+    use alloc::vec::Vec;
+    
+    let path_str = match c_str_from_user(path) {
+        Ok(s) => s,
+        Err(_) => return SyscallResult::error(SyscallError::InvalidArgument)
+    };
     
     // Parse arguments from user space (simplified - assumes null-terminated array of strings)
-    let mut arg_vec: Vec<String> = Vec::new();
+    let arg_vec: Vec<String> = Vec::new();
     if args != 0 {
         // For now, we'll skip parsing complex argument arrays
         // In a real implementation, we would parse the argv array from user space
@@ -317,9 +354,8 @@ fn sys_getppid() -> SyscallResult {
 }
 
 fn sys_sleep(_milliseconds: u64) -> SyscallResult {
-    // sleep_current_process function doesn't exist, using yield and block
-    crate::process::yield_current();
-    crate::process::block_current();
+    // Block current and schedule wake via timer
+    crate::process::sleep_current(_milliseconds);
     SyscallResult::success(0)
 }
 
@@ -328,9 +364,55 @@ fn sys_yield() -> SyscallResult {
     SyscallResult::success(0)
 }
 
+fn sys_thread_create(entry: u64, stack_size: u64) -> SyscallResult {
+    use x86_64::VirtAddr;
+    let entry_va = VirtAddr::new(entry);
+    let sz = if stack_size == 0 { 64 * 1024 } else { stack_size as usize };
+    match crate::process::spawn_user_thread(entry_va, sz) {
+        Ok(tid) => SyscallResult::success(tid as i64),
+        Err(_) => SyscallResult::error(SyscallError::OutOfMemory),
+    }
+}
+
+#[allow(dead_code)]
+fn sys_thread_join(tid: u64) -> SyscallResult {
+    // If target already terminated, return immediately
+    if !crate::process::is_process_alive(tid) {
+        return SyscallResult::success(0);
+    }
+    // Block current until target exits
+    let waiter_pid = crate::process::get_current_process_id();
+    {
+        use alloc::vec::Vec;
+        let mut map = crate::process::JOIN_WAITERS.lock();
+        match map.get_mut(&(tid as u64)) {
+            Some(list) => list.push(waiter_pid),
+            None => { map.insert(tid as u64, Vec::from([waiter_pid])); }
+        }
+    }
+    // Block the current process; it will be unblocked on target exit
+    crate::process::block_current();
+    SyscallResult::success(0)
+}
+
+fn sys_set_priority(level: u64) -> SyscallResult {
+    let priority = match level {
+        0 => crate::process::Priority::High,
+        1 => crate::process::Priority::Normal,
+        2 => crate::process::Priority::Low,
+        3 => crate::process::Priority::Gaming,
+        _ => return SyscallResult::error(SyscallError::InvalidArgument),
+    };
+    crate::process::set_current_priority(priority);
+    SyscallResult::success(0)
+}
+
 // File system syscalls
 fn sys_open(path: u64, flags: u64, _mode: u64) -> SyscallResult {
-    let path_str = unsafe { c_str_from_user(path) };
+    let path_str = match c_str_from_user(path) {
+        Ok(s) => s,
+        Err(_) => return SyscallResult::error(SyscallError::InvalidArgument)
+    };
     match crate::filesystem::open(&path_str, flags as u32) {
         Ok(fd) => SyscallResult::success(fd as i64),
         Err(_) => SyscallResult::error(SyscallError::ResourceNotFound)
@@ -348,7 +430,7 @@ fn sys_read(fd: u64, buffer: u64, count: u64) -> SyscallResult {
     let mut buf = vec![0u8; count as usize];
     match crate::filesystem::read(fd as u64, &mut buf) {
         Ok(bytes_read) => {
-            unsafe { copy_to_user(buffer, &buf[..bytes_read]) };
+            let _ = copy_to_user(buffer, &buf[..bytes_read]);
             SyscallResult::success(bytes_read as i64)
         }
         Err(_) => SyscallResult::error(SyscallError::IoError)
@@ -356,7 +438,10 @@ fn sys_read(fd: u64, buffer: u64, count: u64) -> SyscallResult {
 }
 
 fn sys_write(fd: u64, buffer: u64, count: u64) -> SyscallResult {
-    let data = unsafe { slice_from_user(buffer, count as usize) };
+    let data = match slice_from_user(buffer, count as usize) {
+        Ok(d) => d,
+        Err(_) => return SyscallResult::error(SyscallError::InvalidArgument)
+    };
     match crate::filesystem::write(fd as u64, &data) {
         Ok(bytes_written) => SyscallResult::success(bytes_written as i64),
         Err(_) => SyscallResult::error(SyscallError::IoError)
@@ -378,7 +463,10 @@ fn sys_seek(fd: u64, offset: i64, whence: u64) -> SyscallResult {
 }
 
 fn sys_stat(path: u64, statbuf: u64) -> SyscallResult {
-    let path_str = unsafe { c_str_from_user(path) };
+    let path_str = match c_str_from_user(path) {
+        Ok(s) => s,
+        Err(_) => return SyscallResult::error(SyscallError::InvalidArgument)
+    };
     match crate::filesystem::metadata(&path_str) {
         Ok(stat) => {
             // Create a simple stat structure
@@ -394,7 +482,7 @@ fn sys_stat(path: u64, statbuf: u64) -> SyscallResult {
             ];
             
             unsafe {
-                copy_to_user(statbuf, unsafe_any_as_bytes(&stat_data));
+                let _ = copy_to_user(statbuf, unsafe_any_as_bytes(&stat_data));
             }
             SyscallResult::success(0)
         }
@@ -403,7 +491,10 @@ fn sys_stat(path: u64, statbuf: u64) -> SyscallResult {
 }
 
 fn sys_mkdir(path: u64, _mode: u64) -> SyscallResult {
-    let path_str = unsafe { c_str_from_user(path) };
+    let path_str = match c_str_from_user(path) {
+        Ok(s) => s,
+        Err(_) => return SyscallResult::error(SyscallError::InvalidArgument)
+    };
     match crate::filesystem::create_directory(&path_str) {
         Ok(()) => SyscallResult::success(0),
         Err(_) => SyscallResult::error(SyscallError::IoError)
@@ -411,17 +502,27 @@ fn sys_mkdir(path: u64, _mode: u64) -> SyscallResult {
 }
 
 fn sys_rmdir(path: u64) -> SyscallResult {
-    let path_str = unsafe { c_str_from_user(path) };
-    match crate::filesystem::remove(&path_str) {
-        Ok(()) => SyscallResult::success(0),
+    let path_str = c_str_from_user(path);
+    match path_str {
+        Ok(ref p) => {
+            match crate::filesystem::remove(p) {
+                Ok(()) => SyscallResult::success(0),
+                Err(_) => SyscallResult::error(SyscallError::IoError)
+            }
+        }
         Err(_) => SyscallResult::error(SyscallError::IoError)
     }
 }
 
 fn sys_unlink(path: u64) -> SyscallResult {
-    let path_str = unsafe { c_str_from_user(path) };
-    match crate::filesystem::remove(&path_str) {
-        Ok(()) => SyscallResult::success(0),
+    let path_str = c_str_from_user(path);
+    match path_str {
+        Ok(ref p) => {
+            match crate::filesystem::remove(p) {
+                Ok(()) => SyscallResult::success(0),
+                Err(_) => SyscallResult::error(SyscallError::IoError)
+            }
+        }
         Err(_) => SyscallResult::error(SyscallError::IoError)
     }
 }
@@ -444,8 +545,9 @@ fn sys_mmap(_addr: u64, length: u64, prot: u64, _flags: u64, _fd: u64, _offset: 
         return SyscallResult::error(SyscallError::PermissionDenied);
     }
     
+    let current_as = get_current_process_address_space();
     match crate::vmm::allocate_area(
-        0, // Use current address space ID
+        current_as,
         length,
         crate::vmm::VmAreaType::Heap,
         permissions
@@ -456,7 +558,8 @@ fn sys_mmap(_addr: u64, length: u64, prot: u64, _flags: u64, _fd: u64, _offset: 
 }
 
 fn sys_munmap(addr: u64, _length: u64) -> SyscallResult {
-    match crate::vmm::deallocate_area(0, x86_64::VirtAddr::new(addr)) {
+    let current_as = get_current_process_address_space();
+    match crate::vmm::deallocate_area(current_as, x86_64::VirtAddr::new(addr)) {
         Ok(()) => SyscallResult::success(0),
         Err(_) => SyscallResult::error(SyscallError::InvalidArgument)
     }
@@ -479,8 +582,9 @@ fn sys_mprotect(addr: u64, length: u64, prot: u64) -> SyscallResult {
         return SyscallResult::error(SyscallError::PermissionDenied);
     }
     
+    let current_as = get_current_process_address_space();
     match crate::vmm::protect_memory_api(
-        0, // Use current address space ID
+        current_as,
         x86_64::VirtAddr::new(addr),
         length as usize,
         permissions
@@ -503,7 +607,7 @@ fn sys_pipe(pipefd: u64) -> SyscallResult {
         Ok((read_fd, write_fd)) => {
             let fds = [read_fd as u64, write_fd as u64];
             unsafe {
-                copy_to_user(pipefd, unsafe_any_as_bytes(&fds));
+                let _ = copy_to_user(pipefd, unsafe_any_as_bytes(&fds));
             }
             SyscallResult::success(0)
         }
@@ -519,7 +623,10 @@ fn sys_socket(domain: u64, socket_type: u64, protocol: u64) -> SyscallResult {
 }
 
 fn sys_bind(socket_fd: u64, addr: u64, addr_len: u64) -> SyscallResult {
-    let addr_data = unsafe { slice_from_user(addr, addr_len as usize) };
+    let addr_data = match slice_from_user(addr, addr_len as usize) {
+        Ok(data) => data,
+        Err(_) => return SyscallResult::error(SyscallError::InvalidArgument)
+    };
     match crate::network::bind_socket(socket_fd as u32, &addr_data) {
         Ok(()) => SyscallResult::success(0),
         Err(_) => SyscallResult::error(SyscallError::NetworkError)
@@ -544,17 +651,27 @@ fn sys_accept(socket_fd: u64, _addr: u64, _addr_len: u64) -> SyscallResult {
 }
 
 fn sys_connect(socket_fd: u64, addr: u64, addr_len: u64) -> SyscallResult {
-    let addr_data = unsafe { slice_from_user(addr, addr_len as usize) };
-    match crate::network::connect_socket(socket_fd as u32, &addr_data) {
-        Ok(()) => SyscallResult::success(0),
+    let addr_data = slice_from_user(addr, addr_len as usize);
+    match addr_data {
+        Ok(ref data) => {
+            match crate::network::connect_socket(socket_fd as u32, data) {
+                Ok(()) => SyscallResult::success(0),
+                Err(_) => SyscallResult::error(SyscallError::NetworkError)
+            }
+        }
         Err(_) => SyscallResult::error(SyscallError::NetworkError)
     }
 }
 
 fn sys_send(socket_fd: u64, buffer: u64, length: u64, flags: u64) -> SyscallResult {
-    let data = unsafe { slice_from_user(buffer, length as usize) };
-    match crate::network::send_data(socket_fd as u32, &data, flags as u32) {
-        Ok(bytes_sent) => SyscallResult::success(bytes_sent as i64),
+    let data = slice_from_user(buffer, length as usize);
+    match data {
+        Ok(ref d) => {
+            match crate::network::send_data(socket_fd as u32, d, flags as u32) {
+                Ok(bytes_sent) => SyscallResult::success(bytes_sent as i64),
+                Err(_) => SyscallResult::error(SyscallError::NetworkError)
+            }
+        }
         Err(_) => SyscallResult::error(SyscallError::NetworkError)
     }
 }
@@ -563,7 +680,7 @@ fn sys_recv(socket_fd: u64, buffer: u64, length: u64, flags: u64) -> SyscallResu
     match crate::network::receive_data(socket_fd as u32, length as usize, flags as u32) {
         Ok(data) => {
             let bytes_received = data.len();
-            unsafe { copy_to_user(buffer, &data) };
+            let _ = copy_to_user(buffer, &data);
             SyscallResult::success(bytes_received as i64)
         }
         Err(_) => SyscallResult::error(SyscallError::NetworkError)
@@ -640,11 +757,16 @@ fn sys_draw_rect(window_id: u64, x: u64, y: u64, width: u64, height: u64, color:
 }
 
 fn sys_draw_text(window_id: u64, x: u64, y: u64, text: u64, color: u64) -> SyscallResult {
-    let text_str = unsafe { c_str_from_user(text) };
+    let text_str = c_str_from_user(text);
     let c = u32_color_from_u64(color);
     let color = crate::graphics::Color { r: ((c >> 16) & 0xFF) as u8, g: ((c >> 8) & 0xFF) as u8, b: (c & 0xFF) as u8, a: ((c >> 24) & 0xFF) as u8 };
-    match crate::graphics::draw_text(window_id as crate::graphics::WindowId, x as i32, y as i32, &text_str, color) {
-        Ok(()) => SyscallResult::success(0),
+    match text_str {
+        Ok(ref text) => {
+            match crate::graphics::draw_text(window_id as crate::graphics::WindowId, x as i32, y as i32, text, color) {
+                Ok(()) => SyscallResult::success(0),
+                Err(_) => SyscallResult::error(SyscallError::InvalidArgument)
+            }
+        }
         Err(_) => SyscallResult::error(SyscallError::InvalidArgument)
     }
 }
@@ -691,7 +813,7 @@ fn sys_get_frame_stats(buffer: u64) -> SyscallResult {
     match crate::graphics::get_frame_stats() {
         Ok((frame_count, last_present_time)) => {
             let stats = [frame_count, last_present_time];
-            unsafe { copy_to_user(buffer, unsafe_any_as_bytes(&stats)) };
+            let _ = copy_to_user(buffer, unsafe { unsafe_any_as_bytes(&stats) });
             SyscallResult::success(0)
         }
         Err(_) => SyscallResult::error(SyscallError::IoError)
@@ -714,10 +836,15 @@ fn sys_clear_framebuffer(color: u64) -> SyscallResult {
 
 fn sys_blit_buffer(src_buffer: u64, dst_x: u64, dst_y: u64, width: u64, height: u64, stride: u64) -> SyscallResult {
     let buffer_size = (height * stride) as usize;
-    let src_data = unsafe { slice_from_user(src_buffer, buffer_size) };
+    let src_data = slice_from_user(src_buffer, buffer_size);
     
-    match crate::graphics::blit_buffer(&src_data, dst_x as u32, dst_y as u32, width as u32, height as u32, stride as u32) {
-        Ok(()) => SyscallResult::success(0),
+    match src_data {
+        Ok(ref data) => {
+            match crate::graphics::blit_buffer(data, dst_x as u32, dst_y as u32, width as u32, height as u32, stride as u32) {
+                Ok(()) => SyscallResult::success(0),
+                Err(_) => SyscallResult::error(SyscallError::InvalidArgument)
+            }
+        }
         Err(_) => SyscallResult::error(SyscallError::InvalidArgument)
     }
 }
@@ -734,7 +861,7 @@ fn sys_get_window_list(buffer: u64, max_count: u64) -> SyscallResult {
     let count = core::cmp::min(window_ids.len(), max_count as usize);
     let data = &window_ids[..count];
     let bytes = unsafe { core::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * core::mem::size_of::<u32>()) };
-    unsafe { copy_to_user(buffer, bytes) };
+    let _ = copy_to_user(buffer, bytes);
     SyscallResult::success(count as i64)
 }
 
@@ -847,7 +974,7 @@ fn sys_get_permissions(buffer: u64) -> SyscallResult {
     match crate::security::get_process_permissions(current_pid) {
         Ok(permissions) => {
             unsafe {
-                copy_to_user(buffer, unsafe_any_as_bytes(&permissions));
+                let _ = copy_to_user(buffer, unsafe_any_as_bytes(&permissions));
             }
             SyscallResult::success(core::mem::size_of_val(&permissions) as i64)
         }
@@ -919,25 +1046,34 @@ fn sys_cap_delegate(handle_id: u64, target_pid: u64, new_rights: u64) -> Syscall
 // AI syscalls
 fn sys_ai_query(query: u64, response_buffer: u64, buffer_size: u64) -> SyscallResult {
     // Minimal placeholder: echo back input length
-    let data = unsafe { slice_from_user(query, core::cmp::min(buffer_size as usize, 256)) };
-    let reply = format!("AI: received {} bytes", data.len());
-    unsafe { copy_to_user(response_buffer, reply.as_bytes()) };
+    let data = slice_from_user(query, core::cmp::min(buffer_size as usize, 256));
+    let reply = match data {
+        Ok(ref d) => format!("AI: received {} bytes", d.len()),
+        Err(_) => alloc::string::String::from("AI: error reading input"),
+    };
+    let _ = copy_to_user(response_buffer, reply.as_bytes());
     SyscallResult::success(reply.len() as i64)
 }
 
 fn sys_ai_generate(prompt: u64, output_buffer: u64, buffer_size: u64) -> SyscallResult {
     // Implement AI generation
-    let prompt_str = unsafe { c_str_from_user(prompt) };
+    let prompt_str = match c_str_from_user(prompt) {
+        Ok(s) => s,
+        Err(_) => return SyscallResult::error(SyscallError::InvalidArgument)
+    };
     
     match crate::rae_assistant::generate_ai_response(&prompt_str) {
         Ok(response) => {
             let response_bytes = response.as_bytes();
             let copy_len = core::cmp::min(response_bytes.len(), buffer_size as usize - 1);
             
-            unsafe {
-                copy_to_user(output_buffer, &response_bytes[..copy_len]);
-                // Null terminate
-                core::ptr::write((output_buffer + copy_len as u64) as *mut u8, 0);
+            if let Err(_) = copy_to_user(output_buffer, &response_bytes[..copy_len]) {
+                return SyscallResult::error(SyscallError::InvalidArgument);
+            }
+            // Null terminate using safe user access
+            let null_byte = [0u8];
+            if let Err(_) = copy_to_user(output_buffer + copy_len as u64, &null_byte) {
+                return SyscallResult::error(SyscallError::InvalidArgument);
             }
             
             SyscallResult::success(copy_len as i64)
@@ -948,17 +1084,23 @@ fn sys_ai_generate(prompt: u64, output_buffer: u64, buffer_size: u64) -> Syscall
 
 fn sys_ai_analyze(data: u64, analysis_buffer: u64, buffer_size: u64) -> SyscallResult {
     // Implement AI analysis
-    let data_str = unsafe { c_str_from_user(data) };
+    let data_str = match c_str_from_user(data) {
+        Ok(s) => s,
+        Err(_) => return SyscallResult::error(SyscallError::InvalidArgument)
+    };
     
     match crate::rae_assistant::analyze_content(&data_str) {
         Ok(analysis) => {
             let analysis_bytes = analysis.as_slice();
             let copy_len = core::cmp::min(analysis_bytes.len(), buffer_size as usize - 1);
             
-            unsafe {
-                copy_to_user(analysis_buffer, &analysis_bytes[..copy_len]);
-                // Null terminate
-                core::ptr::write((analysis_buffer + copy_len as u64) as *mut u8, 0);
+            if let Err(_) = copy_to_user(analysis_buffer, &analysis_bytes[..copy_len]) {
+                return SyscallResult::error(SyscallError::InvalidArgument);
+            }
+            // Null terminate using safe user access
+            let null_byte = [0u8];
+            if let Err(_) = copy_to_user(analysis_buffer + copy_len as u64, &null_byte) {
+                return SyscallResult::error(SyscallError::InvalidArgument);
             }
             
             SyscallResult::success(copy_len as i64)
@@ -982,7 +1124,9 @@ pub extern "C" fn syscall_handler(
     if result.success {
         result.value as u64
     } else {
-        (-(result.error_code.unwrap() as i32)) as u64
+        // Convert error code to negative value, default to -1 if none
+        let error_val = result.error_code.map(|e| e as i32).unwrap_or(1);
+        (-(error_val)) as u64
     }
 }
 
@@ -1004,7 +1148,10 @@ fn setup_syscall_entry() {
     let kernel_cs_selector = SegmentSelector::new(1, PrivilegeLevel::Ring0); // GDT index 1
     let user_cs_selector = SegmentSelector::new(2, PrivilegeLevel::Ring3);   // GDT index 2
     let user_ss_selector = SegmentSelector::new(3, PrivilegeLevel::Ring3);   // GDT index 3
-    Star::write(kernel_cs_selector, user_cs_selector, user_ss_selector, user_cs_selector).unwrap();
+    if let Err(_) = Star::write(kernel_cs_selector, user_cs_selector, user_ss_selector, user_cs_selector) {
+        crate::serial::_print(format_args!("[SYSCALL] WARNING: Failed to set up STAR MSR\n"));
+        return;
+    }
     
     // Set LSTAR to point to our syscall entry point
     LStar::write(VirtAddr::new(syscall_entry as u64));
@@ -1028,13 +1175,21 @@ extern "C" {
 core::arch::global_asm!(
     ".global syscall_entry",
     "syscall_entry:",
-    // Save user stack pointer
-    "mov gs:[0x10], rsp",  // Save user RSP to per-CPU area
+    // First, swap GS bases: user GS -> KERNEL_GS_BASE, kernel GS -> GS_BASE
+    "swapgs",
     
-    // Switch to kernel stack
-    "mov rsp, gs:[0x08]",  // Load kernel RSP from per-CPU area
+    // Now GS points to kernel per-CPU data
+    // Save user stack pointer at offset 0x58 (user_stack field)
+    "mov gs:[0x58], rsp",
     
-    // Save user registers
+    // Switch to kernel stack from offset 0x50 (kernel_stack field)
+    "mov rsp, gs:[0x50]",
+    
+    // Check if kernel stack is valid
+    "test rsp, rsp",
+    "jz syscall_no_kstack",
+    
+    // Save user registers on kernel stack
     "push rcx",            // User RIP (saved by SYSCALL)
     "push r11",            // User RFLAGS (saved by SYSCALL)
     "push rax",            // Syscall number
@@ -1060,9 +1215,19 @@ core::arch::global_asm!(
     "pop rcx",             // Restore user RIP
     
     // Restore user stack pointer
-    "mov rsp, gs:[0x10]",
+    "mov rsp, gs:[0x58]",
+    
+    // Swap GS bases back: kernel GS -> KERNEL_GS_BASE, user GS -> GS_BASE
+    "swapgs",
     
     // Return to userspace
+    "sysretq",
+    
+    "syscall_no_kstack:",
+    // Emergency: no kernel stack, try to recover
+    "mov rsp, gs:[0x58]",  // Restore user stack
+    "swapgs",              // Restore user GS
+    "mov rax, -1",         // Return error
     "sysretq"
 );
 
@@ -1081,17 +1246,49 @@ extern "C" fn syscall_handler_wrapper(
     syscall_handler(syscall_num, arg1, arg2, arg3, arg4, arg5, arg6)
 }
 
-// ------- helper functions for user pointers (temporary, unsafe) -------
-unsafe fn c_str_from_user(ptr: u64) -> alloc::string::String {
+// ------- Helper functions for syscall implementation -------
+
+/// Get the current process's address space ID
+fn get_current_process_address_space() -> u64 {
+    let current_pid = crate::percpu::get_current_process();
+    if current_pid == 0 {
+        return 0; // Kernel/idle process uses address space 0
+    }
+    
+    // Try to get the address space ID from the process
+    if let Some(sched) = crate::process::get_smp_scheduler().try_lock() {
+        let cpu_id = crate::percpu::current_cpu_id();
+        if let Some(process) = sched.get_current_process(cpu_id) {
+            return process.address_space_id.unwrap_or(0);
+        }
+    }
+    
+    // Fallback to address space 0 if we can't determine the process's AS
+    0
+}
+
+// ------- Safe user access helper functions using new uaccess API -------
+fn c_str_from_user(ptr: u64) -> Result<alloc::string::String, crate::arch::uaccess::UAccessError> {
+    crate::arch::uaccess::read_cstr_from_user(ptr, 4096)
+}
+
+fn slice_from_user(ptr: u64, len: usize) -> Result<Vec<u8>, crate::arch::uaccess::UAccessError> {
+    let mut buffer = vec![0u8; len];
+    crate::arch::uaccess::copy_from_user(&mut buffer, ptr)?;
+    Ok(buffer)
+}
+
+fn copy_to_user(dst: u64, src: &[u8]) -> Result<(), crate::arch::uaccess::UAccessError> {
+    crate::arch::uaccess::copy_to_user(dst, src)
+}
+
+// DEPRECATED: Legacy unsafe functions - to be removed
+// These should be replaced with safe uaccess functions above
+#[allow(dead_code)]
+unsafe fn c_str_from_user_unsafe(ptr: u64) -> alloc::string::String {
     let mut v = Vec::new();
     let mut p = ptr as *const u8;
     loop {
-        // SAFETY: This is unsafe because:
-        // - ptr must be a valid user-space pointer to a null-terminated C string
-        // - The memory region must be readable by the current process
-        // - The string must be null-terminated within reasonable bounds (4096 bytes)
-        // - User pointer validation should occur before calling this function
-        // - This assumes the user process has not been deallocated during the syscall
         let b = core::ptr::read(p);
         if b == 0 { break; }
         v.push(b);
@@ -1101,26 +1298,16 @@ unsafe fn c_str_from_user(ptr: u64) -> alloc::string::String {
     alloc::string::String::from_utf8_lossy(&v).into_owned()
 }
 
-unsafe fn slice_from_user(ptr: u64, len: usize) -> Vec<u8> {
+#[allow(dead_code)]
+unsafe fn slice_from_user_unsafe(ptr: u64, len: usize) -> Vec<u8> {
     let mut v = Vec::with_capacity(len);
-    // SAFETY: This is unsafe because:
-    // - We're setting the length without initializing the memory
-    // - The subsequent copy_nonoverlapping will initialize all bytes
-    // - len must not exceed the allocated capacity
     v.set_len(len);
-    // SAFETY: This is unsafe because:
-    // - ptr must be a valid user-space pointer to readable memory
-    // - The memory region [ptr, ptr + len) must be valid and readable
-    // - len must not cause integer overflow when added to ptr
-    // - The destination buffer must have sufficient capacity (guaranteed by set_len above)
-    // - User pointer validation should occur before calling this function
     core::ptr::copy_nonoverlapping(ptr as *const u8, v.as_mut_ptr(), len);
     v
 }
 
-unsafe fn copy_to_user(dst: u64, src: &[u8]) {
-    // SAFETY: This is unsafe because:
-    // - dst must be a valid user-space pointer to writable memory
+#[allow(dead_code)]
+unsafe fn copy_to_user_unsafe(dst: u64, src: &[u8]) {
     // - The memory region [dst, dst + src.len()) must be valid and writable
     // - src.len() must not cause integer overflow when added to dst
     // - The source and destination must not overlap (nonoverlapping requirement)

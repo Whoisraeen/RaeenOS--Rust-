@@ -5,7 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand};
 use walkdir::WalkDir;
-use serde::{Deserialize, Serialize};
+// use serde::{Deserialize, Serialize}; // Temporarily disabled due to serde dependency conflicts
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 use sha2::{Sha256, Digest};
@@ -13,7 +13,7 @@ use tar::Builder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)] // Serialize, Deserialize temporarily disabled
 struct PackageManifest {
     name: String,
     version: String,
@@ -687,7 +687,8 @@ fn create_native_package(
     let mut tar = Builder::new(enc);
     
     // Add manifest
-    let manifest_json = serde_json::to_string_pretty(manifest)?;
+    // let manifest_json = serde_json::to_string_pretty(manifest)?; // Temporarily disabled due to serde dependency conflicts
+    let manifest_json = format!("{{\"name\": \"{}\", \"version\": \"{}\", \"description\": \"{}\"}}", manifest.name, manifest.version, manifest.description);
     let mut header = tar::Header::new_gnu();
     header.set_path("manifest.json")?;
     header.set_size(manifest_json.len() as u64);

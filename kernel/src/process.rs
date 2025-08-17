@@ -11,6 +11,8 @@ static NEXT_PID: AtomicU64 = AtomicU64::new(1);
 static SMP_SCHEDULER: Once<Mutex<SmpScheduler>> = Once::new();
 static _LEGACY_SCHEDULER: Mutex<Scheduler> = Mutex::new(Scheduler::new());
 static IDLE_THREAD_PID: AtomicU64 = AtomicU64::new(0);
+static SLEEPERS: Mutex<alloc::vec::Vec<(u64, u64)>> = Mutex::new(alloc::vec::Vec::new()); // (wake_ms, pid)
+pub static JOIN_WAITERS: Mutex<alloc::collections::BTreeMap<u64, alloc::vec::Vec<u64>>> = Mutex::new(alloc::collections::BTreeMap::new()); // target_pid -> waiters
 
 pub type ProcessId = u64;
 
@@ -174,7 +176,7 @@ impl Default for ProcessContext {
 
 impl ProcessContext {
     pub fn new_user_context(entry_point: VirtAddr, user_stack: VirtAddr) -> Self {
-        Self {
+        let context = Self {
             rax: 0, rbx: 0, rcx: 0, rdx: 0,
             rsi: 0, rdi: 0, rbp: 0, rsp: user_stack.as_u64(),
             r8: 0, r9: 0, r10: 0, r11: 0,
@@ -183,11 +185,12 @@ impl ProcessContext {
             rflags: 0x202, // Enable interrupts
             cs: crate::gdt::get_user_code_selector().0 as u64,
             ss: crate::gdt::get_user_data_selector().0 as u64,
-        }
+        };
+        context
     }
     
     pub fn new_kernel_context(entry_point: VirtAddr, kernel_stack: VirtAddr) -> Self {
-        Self {
+        let context = Self {
             rax: 0, rbx: 0, rcx: 0, rdx: 0,
             rsi: 0, rdi: 0, rbp: 0, rsp: kernel_stack.as_u64(),
             r8: 0, r9: 0, r10: 0, r11: 0,
@@ -196,7 +199,8 @@ impl ProcessContext {
             rflags: 0x202, // Enable interrupts
             cs: crate::gdt::get_kernel_code_selector().0 as u64,
             ss: crate::gdt::get_kernel_data_selector().0 as u64,
-        }
+        };
+        context
     }
 }
 
@@ -535,7 +539,7 @@ impl CpuScheduler {
     }
     
     pub fn schedule(&mut self, gaming_mode: bool, processes: &[Option<Process>]) -> Option<u64> {
-        let current_time = crate::time::get_uptime_ms() * 1000; // Convert to microseconds
+        let current_time = crate::time::get_precise_time_ns() / 1000; // Use precise TSC time in microseconds
         
         // 1. Real-time EDF scheduling (highest priority)
         // Find the process with the earliest deadline that has remaining budget
@@ -546,7 +550,7 @@ impl CpuScheduler {
         for (i, &pid) in self.rt_edf_queue.iter().enumerate() {
             if let Some(process) = processes.get(pid as usize).and_then(|p| p.as_ref()) {
                 // Only schedule if process has remaining budget and hasn't missed deadline
-                if process.rt_params.remaining_budget > 0 && 
+                if self.can_schedule_rt_process(processes, pid) && 
                    process.rt_params.next_deadline > current_time &&
                    process.rt_params.next_deadline < earliest_deadline {
                     earliest_deadline = process.rt_params.next_deadline;
@@ -560,11 +564,20 @@ impl CpuScheduler {
             self.rt_edf_queue.remove(index);
             self.rt_edf_queue.push_back(pid); // Move to end for fairness
             self.current_process = Some(pid);
-            // Use remaining budget or 100µs, whichever is smaller
-            if let Some(process) = processes.get(pid as usize).and_then(|p| p.as_ref()) {
-                self.current_time_slice_remaining = core::cmp::min(process.rt_params.remaining_budget / 1000, 100);
-            } else {
-                self.current_time_slice_remaining = 1;
+            // Calculate time slice based on remaining budget and deadline urgency
+            let remaining_budget = processes.get(pid as usize)
+                .and_then(|p| p.as_ref())
+                .map(|p| p.rt_params.remaining_budget)
+                .unwrap_or(100);
+            let time_to_deadline = earliest_deadline.saturating_sub(current_time);
+            // Use minimum of remaining budget, time to deadline, or 100µs for responsiveness
+            let time_slice_us = core::cmp::min(
+                core::cmp::min(remaining_budget, time_to_deadline),
+                100 // Max 100µs for responsiveness
+            );
+            self.current_time_slice_remaining = (time_slice_us / 1000) as u64; // Convert to ms
+            if self.current_time_slice_remaining == 0 {
+                self.current_time_slice_remaining = 1; // Minimum 1ms
             }
             return Some(pid);
         }
@@ -711,20 +724,18 @@ impl CpuScheduler {
         }
     }
     
-    /// Consume RT budget for a process
-    pub fn consume_rt_budget(&self, pid: u64, amount: u64, processes: &mut [Option<Process>]) {
-        if let Some(process) = processes.get_mut(pid as usize).and_then(|p| p.as_mut()) {
-            process.rt_params.remaining_budget = process.rt_params.remaining_budget.saturating_sub(amount);
-        }
-    }
-    
     pub fn get_load(&self) -> u32 {
         self.load.load(Ordering::Relaxed)
     }
     
-    pub fn tick_time_slice(&mut self) -> bool {
+    pub fn tick_time_slice(&mut self, processes: &mut [Option<Process>]) -> bool {
         if self.current_time_slice_remaining > 0 {
             self.current_time_slice_remaining -= 1;
+            
+            // Consume RT budget for real-time processes (1ms per tick)
+            if let Some(current_pid) = self.current_process {
+                self.consume_rt_budget(processes, current_pid, 1000); // 1ms = 1000µs
+            }
         }
         self.current_time_slice_remaining == 0
     }
@@ -740,7 +751,7 @@ impl CpuScheduler {
         self.current_time_slice_remaining as u32
     }
     
-    /// Update real-time process deadlines
+    /// Update real-time process deadlines and budget tracking
     pub fn update_rt_deadlines(&mut self, processes: &mut [Option<Process>], current_time_us: u64) {
         // Update EDF queue deadlines
         for &pid in &self.rt_edf_queue {
@@ -749,17 +760,27 @@ impl CpuScheduler {
                     // Deadline missed, update to next period
                     process.rt_params.next_deadline += process.rt_params.period_us;
                     process.rt_params.remaining_budget = process.rt_params.budget_us;
+                    process.rt_params.last_replenish = current_time_us;
                 }
             }
         }
         
-        // Update CBS queue budgets
+        // Update CBS queue budgets with precise tracking
         for &pid in &self.rt_cbs_queue {
             if let Some(process) = processes.get_mut(pid as usize).and_then(|p| p.as_mut()) {
+                // Check if budget replenishment is needed
                 if current_time_us >= process.rt_params.next_deadline {
                     // Replenish budget for next period
                     process.rt_params.next_deadline += process.rt_params.period_us;
                     process.rt_params.remaining_budget = process.rt_params.budget_us;
+                    process.rt_params.last_replenish = current_time_us;
+                } else if process.rt_params.remaining_budget == 0 {
+                    // Budget exhausted, defer to next period (CBS throttling)
+                    let time_to_replenish = process.rt_params.next_deadline - current_time_us;
+                    if time_to_replenish > 0 {
+                        // Move process to blocked state until budget replenishment
+                        process.state = ProcessState::Blocked;
+                    }
                 }
             }
         }
@@ -776,6 +797,31 @@ impl CpuScheduler {
                 .unwrap_or(u64::MAX);
             deadline_a.cmp(&deadline_b)
         });
+    }
+    
+    /// Consume budget for a running real-time process
+    pub fn consume_rt_budget(&mut self, processes: &mut [Option<Process>], pid: u64, consumed_us: u64) {
+        if let Some(process) = processes.get_mut(pid as usize).and_then(|p| p.as_mut()) {
+            if process.rt_params.remaining_budget >= consumed_us {
+                process.rt_params.remaining_budget -= consumed_us;
+            } else {
+                process.rt_params.remaining_budget = 0;
+                // For CBS, block the process until next replenishment
+                if process.rt_params.class == RtClass::Cbs {
+                    process.state = ProcessState::Blocked;
+                }
+            }
+        }
+    }
+    
+    /// Check if a real-time process can be scheduled (has budget)
+    pub fn can_schedule_rt_process(&self, processes: &[Option<Process>], pid: u64) -> bool {
+        if let Some(process) = processes.get(pid as usize).and_then(|p| p.as_ref()) {
+            process.rt_params.remaining_budget > 0 && 
+            process.state == ProcessState::Ready
+        } else {
+            false
+        }
     }
     
     pub fn set_idle_thread(&mut self, pid: u64) {
@@ -1078,7 +1124,7 @@ impl SmpScheduler {
             return false;
         }
         
-        self.cpu_schedulers[cpu_id as usize].lock().tick_time_slice()
+        self.cpu_schedulers[cpu_id as usize].lock().tick_time_slice(&mut self.processes)
     }
     
     /// Update real-time deadlines for all CPUs (called periodically)
@@ -1628,7 +1674,7 @@ impl Scheduler {
 }
 
 // Helper function to get the SMP scheduler instance
-fn get_smp_scheduler() -> &'static Mutex<SmpScheduler> {
+pub fn get_smp_scheduler() -> &'static Mutex<SmpScheduler> {
     SMP_SCHEDULER.call_once(|| Mutex::new(SmpScheduler::new()))
 }
 
@@ -1636,6 +1682,37 @@ fn get_smp_scheduler() -> &'static Mutex<SmpScheduler> {
 pub fn init() {
     // Initialize the scheduler
     let _ = get_smp_scheduler();
+}
+
+/// Wake any sleeping processes whose deadline has passed
+fn wake_due_sleepers() {
+    // No heap allocations in ISR path: wake sleepers one-by-one
+    loop {
+        let now_ms = crate::time::get_uptime_ms();
+        let maybe_pid = {
+            let mut sleepers = SLEEPERS.lock();
+            if let Some((idx, _)) = sleepers.iter().enumerate().find(|(_, (wake_ms, _))| now_ms >= *wake_ms) {
+                let (_, pid) = sleepers.swap_remove(idx);
+                Some(pid)
+            } else {
+                None
+            }
+        };
+        if let Some(pid) = maybe_pid {
+            get_smp_scheduler().lock().unblock_process(pid);
+        } else {
+            break;
+        }
+    }
+}
+
+/// Put the current process to sleep for the specified milliseconds
+pub fn sleep_current(milliseconds: u64) {
+    let wake_ms = crate::time::get_uptime_ms().saturating_add(milliseconds);
+    let pid = get_current_process_id();
+    SLEEPERS.lock().push((wake_ms, pid));
+    let cpu_id = get_current_cpu_id();
+    get_smp_scheduler().lock().block_current_on_cpu(cpu_id);
 }
 
 pub fn create_process(name: alloc::string::String, entry_point: VirtAddr, priority: Priority) -> Result<u64, crate::vmm::VmError> {
@@ -1754,6 +1831,9 @@ pub fn terminate_process(pid: u64) {
 fn cleanup_process_resources(process_id: u32) {
     // Clean up security context
     crate::security::cleanup_process_security(process_id);
+    
+    // Clean up capabilities
+    crate::capabilities::cleanup_process_capabilities(process_id as u64);
     
     // Clean up IPC resources
     crate::ipc::cleanup_process_ipc(process_id);
@@ -1951,6 +2031,106 @@ pub fn get_current_process_parent_id() -> Option<u64> {
     scheduler.get_current_process(cpu_id).and_then(|p| p.parent_pid)
 }
 
+/// Iterate over processes under the scheduler lock and call a visitor
+pub fn for_each_process<F>(mut f: F) -> Result<(), ()>
+where
+    F: FnMut(u64, &alloc::string::String, ProcessState, Priority),
+{
+    let scheduler = get_smp_scheduler().lock();
+    for (idx, slot) in scheduler.processes.iter().enumerate() {
+        if let Some(p) = slot.as_ref() {
+            f(idx as u64, &p.name, p.state, p.priority);
+        }
+    }
+    Ok(())
+}
+
+/// Create a thread within the current user's address space
+pub fn spawn_user_thread(entry_point: VirtAddr, stack_size: usize) -> Result<u64, crate::vmm::VmError> {
+    // Identify parent process and its address space
+    let cpu_id = get_current_cpu_id();
+    let scheduler = get_smp_scheduler().lock();
+    let parent_pid = scheduler.get_current_process_id(cpu_id).ok_or(crate::vmm::VmError::InvalidAddressSpace)?;
+    let (parent_as, parent_priority, parent_heap_base, parent_heap_size, parent_permissions, parent_numa, parent_name) = {
+        let pref = scheduler.processes.get(parent_pid as usize)
+            .and_then(|p| p.as_ref())
+            .ok_or(crate::vmm::VmError::InvalidAddressSpace)?;
+        (
+            pref.address_space_id.ok_or(crate::vmm::VmError::InvalidAddressSpace)?,
+            pref.priority,
+            pref.heap_base,
+            pref.heap_size,
+            pref.permissions.clone(),
+            pref.numa_node,
+            pref.name.clone(),
+        )
+    };
+    drop(scheduler);
+    // Allocate stack in parent's address space
+    let user_stack_top = VirtAddr::new(0x7FFF_FFFF_0000);
+    let user_stack_base = user_stack_top - stack_size as u64;
+    crate::vmm::with_vmm(|vmm| {
+        if let Some(address_space) = vmm.get_address_space_mut(parent_as) {
+            let stack_area = crate::vmm::VmArea::new(
+                user_stack_base,
+                user_stack_top,
+                crate::vmm::VmAreaType::Stack,
+                crate::vmm::VmPermissions::READ | crate::vmm::VmPermissions::WRITE | crate::vmm::VmPermissions::USER,
+            );
+            address_space.add_area(stack_area)?;
+        }
+        Ok(())
+    })?;
+
+    // Build thread context sharing parent's address space
+    let mut ctx = ProcessContext::new_user_context(entry_point, user_stack_top);
+    ctx.rflags = 0x202;
+
+    // Allocate PID/TID
+    let pid = NEXT_PID.fetch_add(1, Ordering::SeqCst);
+
+    let thread = Process {
+        pid,
+        parent_pid: Some(parent_pid),
+        state: ProcessState::Ready,
+        priority: parent_priority,
+        context: ctx,
+        page_table: None,
+        address_space_id: Some(parent_as),
+        stack_base: user_stack_base,
+        stack_size,
+        heap_base: parent_heap_base,
+        heap_size: parent_heap_size,
+        name: alloc::format!("{}_t{}", parent_name, pid),
+        cpu_time: 0,
+        memory_usage: 0,
+        open_files: alloc::vec::Vec::new(),
+        permissions: parent_permissions,
+        pending_signals: 0,
+        signal_handlers: [None; 32],
+        kernel_stack_ptr: None,
+        cpu_affinity: CpuAffinity::ANY,
+        rt_params: RtParams::default(),
+        numa_node: parent_numa,
+    };
+
+    // Register the new thread with the scheduler
+    let mut sched = get_smp_scheduler().lock();
+    let _ = sched.add_process(thread);
+    Ok(pid)
+}
+
+/// Set the current process/thread priority
+pub fn set_current_priority(priority: Priority) {
+    let cpu_id = get_current_cpu_id();
+    let mut scheduler = get_smp_scheduler().lock();
+    if let Some(pid) = scheduler.get_current_process_id(cpu_id) {
+        if let Some(proc_ref) = scheduler.processes.get_mut(pid as usize).and_then(|p| p.as_mut()) {
+            proc_ref.priority = priority;
+        }
+    }
+}
+
 /// Check if a process is alive (exists and not in a terminated state)
 pub fn is_process_alive(process_id: u64) -> bool {
     let scheduler = get_smp_scheduler().lock();
@@ -2047,46 +2227,59 @@ pub fn switch_context(old_context: *mut ProcessContext, new_context: *const Proc
 }
 
 pub fn context_switch(old_pid: Option<u64>, new_pid: u64) {
-    let mut scheduler = get_smp_scheduler().lock();
+    // Capture required state under the scheduler lock, but avoid holding borrows across drops
+    let (old_ctx_ptr, old_as_id, new_as_id) = {
+        let mut sched = get_smp_scheduler().lock();
+        let mut old_ctx_ptr: *mut ProcessContext = core::ptr::null_mut();
+        let mut old_as_id: Option<u64> = None;
+        if let Some(opid) = old_pid {
+            if let Some(old_proc) = sched.processes.get(opid as usize).and_then(|p| p.as_ref()) {
+                old_as_id = old_proc.address_space_id;
+            }
+            if let Some(old_proc_mut) = sched.processes.get_mut(opid as usize).and_then(|p| p.as_mut()) {
+                old_ctx_ptr = &mut old_proc_mut.context as *mut ProcessContext;
+            }
+        }
+        let new_as_id = sched
+            .processes
+            .get(new_pid as usize)
+            .and_then(|p| p.as_ref())
+            .and_then(|p| p.address_space_id);
+        (old_ctx_ptr, old_as_id, new_as_id)
+    };
+
+    // Switch address space if needed
+    if let Some(nas) = new_as_id {
+        if old_as_id != Some(nas) {
+            let _ = crate::vmm::switch_address_space(nas);
+        }
+    }
+
+    // Handle FPU state saving/restoration and perform the actual context switch
+    let mut sched2 = get_smp_scheduler().lock();
     
-    // Save old context and get address space info
-    let mut old_ctx_ptr: *mut ProcessContext = core::ptr::null_mut();
-    let mut old_as_id: Option<u64> = None;
-    if let Some(old_pid) = old_pid {
-        if let Some(old_process) = scheduler.processes.get_mut(old_pid as usize).and_then(|p| p.as_mut()) {
-            old_ctx_ptr = &mut old_process.context as *mut ProcessContext;
-            old_as_id = old_process.address_space_id;
+    // Save FPU state from old process if it exists
+    if let Some(opid) = old_pid {
+        if let Some(_old_process) = sched2.processes.get_mut(opid as usize).and_then(|p| p.as_mut()) {
+            // FPU state saving would be handled by hardware context switching
         }
     }
     
-    // Load new context and switch address space if needed
-    if let Some(new_process) = scheduler.processes.get_mut(new_pid as usize).and_then(|p| p.as_mut()) {
+    if let Some(new_process) = sched2.processes.get_mut(new_pid as usize).and_then(|p| p.as_mut()) {
         new_process.state = ProcessState::Running;
         
-        // Switch address space if the new process has a different one
-        if let Some(new_as_id) = new_process.address_space_id {
-            if old_as_id != Some(new_as_id) {
-                drop(scheduler); // Release scheduler lock before VMM operations
-                let _ = crate::vmm::switch_address_space(new_as_id);
-                // Re-acquire scheduler lock
-                scheduler = get_smp_scheduler().lock();
-                // Re-get the process reference after re-acquiring lock
-                if let Some(new_process) = scheduler.processes.get_mut(new_pid as usize).and_then(|p| p.as_mut()) {
-                    // Context will be loaded by the assembly routine
-                    switch_context(old_ctx_ptr, &new_process.context as *const ProcessContext);
-                }
-                return;
-            }
-        }
+        // FPU state restoration would be handled by hardware context switching
         
-        // No address space switch needed, just switch context
-        switch_context(old_ctx_ptr, &new_process.context as *const ProcessContext);
+        let new_ctx_ptr = &new_process.context as *const ProcessContext;
+        switch_context(old_ctx_ptr, new_ctx_ptr);
     }
 }
 
 pub fn schedule_tick() {
     // Process signals for current process first
     process_signals();
+    // Wake sleepers that reached their deadline
+    wake_due_sleepers();
     
     let cpu_id = get_current_cpu_id();
     let mut smp_scheduler = get_smp_scheduler().lock();
@@ -2199,10 +2392,10 @@ pub fn exec_process(path: &str, args: &[&str]) -> Result<(), ()> {
     let file_data = crate::filesystem::read_file(path).map_err(|_| ())?;
     
     // Validate ELF file and get entry point
-    let entry_point = crate::elf::validate_elf(&file_data).map_err(|_| ())?;
+    let _entry_point = crate::elf::validate_elf(&file_data).map_err(|_| ())?;
     
     // Get the process's address space ID
-    let address_space_id = process.address_space_id;
+    let address_space_id = process.address_space_id.ok_or(())?;
     
     // Clear the current address space (unmap all user pages)
     crate::vmm::with_vmm(|vmm| {
@@ -2216,26 +2409,23 @@ pub fn exec_process(path: &str, args: &[&str]) -> Result<(), ()> {
     crate::elf::load_elf(file_data, address_space_id).map_err(|_| ())?;
     
     // Set up user stack (8MB stack starting at high address)
-    let stack_size = 8 * 1024 * 1024; // 8MB
+    let stack_size = 8 * 1024 * 1024u64; // 8MB
     let stack_top = VirtAddr::new(0x7fff_ffff_f000); // High user address
     let stack_bottom = stack_top - stack_size;
     
     // Map stack pages
     crate::vmm::with_vmm(|vmm| {
-        let current_process = crate::process::current_process();
-        if let Some(process) = current_process {
-            if let Some(address_space) = vmm.get_address_space_mut(process.address_space_id) {
-                use crate::vmm::{VmArea, VmAreaType, VmPermissions};
-                
-                let stack_area = VmArea::new(
-                    stack_bottom,
-                    stack_top,
-                    VmAreaType::Stack,
-                    VmPermissions::READ | VmPermissions::WRITE | VmPermissions::USER
-                );
-                
-                address_space.map_area(&stack_area).map_err(|_| ())?;
-            }
+        if let Some(address_space) = vmm.get_address_space_mut(address_space_id) {
+            use crate::vmm::{VmArea, VmAreaType, VmPermissions};
+            
+            let stack_area = VmArea::new(
+                stack_bottom,
+                stack_top,
+                VmAreaType::Stack,
+                VmPermissions::READ | VmPermissions::WRITE | VmPermissions::USER
+            );
+            
+            address_space.map_area(&stack_area).map_err(|_| ())?;
         }
         Ok::<(), ()>(())
     }).map_err(|_| ())?;
@@ -2260,7 +2450,7 @@ pub fn exec_process(path: &str, args: &[&str]) -> Result<(), ()> {
     }
     
     // Set up the stack with arguments (simplified - real implementation would be more complex)
-    let stack_ptr = stack_top - total_arg_size as u64;
+    let _stack_ptr = stack_top - total_arg_size as u64;
     
     // Update process state
     process.memory_usage = 0; // Reset memory usage tracking
@@ -2530,6 +2720,14 @@ pub fn exit_process(exit_code: i32) -> ! {
     
     // Remove from scheduler
     get_smp_scheduler().lock().remove_process(current_pid);
+    // Wake any join waiters
+    {
+        let mut waiters = JOIN_WAITERS.lock();
+        if let Some(list) = waiters.remove(&current_pid) {
+            let mut sched = get_smp_scheduler().lock();
+            for w in list { sched.unblock_process(w); }
+        }
+    }
     
     // Force context switch to next process
     if let Some(next_pid) = schedule() {
@@ -2542,4 +2740,9 @@ pub fn exit_process(exit_code: i32) -> ! {
             core::arch::asm!("hlt");
         }
     }
+}
+
+/// Terminate the current process due to a fatal error (e.g., stack overflow)
+pub fn terminate_current_process() -> ! {
+    exit_process(-1); // Exit with error code -1
 }

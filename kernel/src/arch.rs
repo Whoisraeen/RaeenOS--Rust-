@@ -1116,6 +1116,320 @@ pub mod cr4 {
     }
 }
 
+/// SMAP-aware user access helpers
+pub mod uaccess {
+    // use crate::vmm::VmAreaType;  // Unused import
+    
+    /// Error codes for user access operations
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    pub enum UAccessError {
+        InvalidPointer,
+        InvalidLength,
+        PermissionDenied,
+        PageFault,
+        AddressSpaceError,
+    }
+    
+    /// Enable AC flag for SMAP bypass (stac instruction)
+    #[inline]
+    unsafe fn enable_user_access() {
+        if super::cr4::has_bits(super::cr4::CR4_SMAP) {
+            core::arch::asm!("stac", options(nomem, nostack));
+        }
+    }
+    
+    /// Disable AC flag to re-enable SMAP protection (clac instruction)
+    #[inline]
+    unsafe fn disable_user_access() {
+        if super::cr4::has_bits(super::cr4::CR4_SMAP) {
+            core::arch::asm!("clac", options(nomem, nostack));
+        }
+    }
+    
+    /// Validate that a user pointer and length are safe to access
+    fn validate_user_range(ptr: u64, len: usize) -> Result<(), UAccessError> {
+        if ptr == 0 {
+            return Err(UAccessError::InvalidPointer);
+        }
+        
+        if len == 0 {
+            return Ok(()); // Zero-length access is valid
+        }
+        
+        // Check for overflow
+        let end_addr = ptr.checked_add(len as u64)
+            .ok_or(UAccessError::InvalidLength)?;
+        
+        // Check that this is in user space (below 0x800000000000 on x86_64)
+        const USER_SPACE_MAX: u64 = 0x7FFFFFFFFFFF;
+        if ptr >= USER_SPACE_MAX || end_addr > USER_SPACE_MAX {
+            return Err(UAccessError::InvalidPointer);
+        }
+        
+        // TODO: Check against current process's VMAs when VMA tracking is complete
+        // For now, just basic range validation
+        
+        Ok(())
+    }
+    
+    /// Copy data from user space to kernel space
+    pub fn copy_from_user(dst: &mut [u8], src_ptr: u64) -> Result<(), UAccessError> {
+        validate_user_range(src_ptr, dst.len())?;
+        
+        unsafe {
+            enable_user_access();
+            
+            // TODO: Implement proper page fault handling for user copies
+            // For now, perform the copy directly - page faults will be handled by the page fault handler
+            core::ptr::copy_nonoverlapping(
+                src_ptr as *const u8,
+                dst.as_mut_ptr(),
+                dst.len()
+            );
+            
+            disable_user_access();
+            Ok(())
+        }
+    }
+    
+    /// Copy data from kernel space to user space
+    pub fn copy_to_user(dst_ptr: u64, src: &[u8]) -> Result<(), UAccessError> {
+        validate_user_range(dst_ptr, src.len())?;
+        
+        unsafe {
+            enable_user_access();
+            
+            core::ptr::copy_nonoverlapping(
+                src.as_ptr(),
+                dst_ptr as *mut u8,
+                src.len()
+            );
+            
+            disable_user_access();
+            Ok(())
+        }
+    }
+    
+    /// Read a null-terminated string from user space
+    pub fn read_cstr_from_user(ptr: u64, max_len: usize) -> Result<alloc::string::String, UAccessError> {
+        validate_user_range(ptr, 1)?; // At least check the first byte
+        
+        let mut result = alloc::string::String::new();
+        
+        unsafe {
+            enable_user_access();
+            
+            let mut current_ptr = ptr;
+            for _ in 0..max_len {
+                // Validate each byte access
+                if current_ptr >= 0x7FFFFFFFFFFF {
+                    disable_user_access();
+                    return Err(UAccessError::InvalidPointer);
+                }
+                
+                let byte = core::ptr::read(current_ptr as *const u8);
+                
+                if byte == 0 {
+                    break; // Found null terminator
+                }
+                
+                result.push(byte as char);
+                current_ptr += 1;
+            }
+            
+            disable_user_access();
+        }
+        
+        Ok(result)
+    }
+    
+    /// Read a single value from user space
+    pub fn read_user_value<T: Copy>(ptr: u64) -> Result<T, UAccessError> {
+        validate_user_range(ptr, core::mem::size_of::<T>())?;
+        
+        unsafe {
+            enable_user_access();
+            let value = core::ptr::read(ptr as *const T);
+            disable_user_access();
+            Ok(value)
+        }
+    }
+    
+    /// Write a single value to user space
+    pub fn write_user_value<T: Copy>(ptr: u64, value: T) -> Result<(), UAccessError> {
+        validate_user_range(ptr, core::mem::size_of::<T>())?;
+        
+        unsafe {
+            enable_user_access();
+            core::ptr::write(ptr as *mut T, value);
+            disable_user_access();
+            Ok(())
+        }
+    }
+}
+
+/// FPU/SIMD context management
+pub mod fpu {
+    use x86_64::registers::control::{Cr0, Cr0Flags, Cr4, Cr4Flags};
+    use x86_64::registers::xcontrol::{XCr0, XCr0Flags};
+    
+    /// Size of the XSAVE area (conservative estimate)
+    pub const XSAVE_AREA_SIZE: usize = 4096;
+    
+    /// FPU state structure - aligned to 64 bytes for XSAVE/XRSTOR
+    #[repr(C, align(64))]
+    pub struct FpuState {
+        data: [u8; XSAVE_AREA_SIZE],
+    }
+    
+    impl FpuState {
+        pub fn new() -> Self {
+            Self {
+                data: [0; XSAVE_AREA_SIZE],
+            }
+        }
+        
+        pub fn as_ptr(&self) -> *const u8 {
+            self.data.as_ptr()
+        }
+        
+        pub fn as_mut_ptr(&mut self) -> *mut u8 {
+            self.data.as_mut_ptr()
+        }
+    }
+    
+    /// Initialize FPU and enable SIMD support
+    pub fn init() -> Result<(), &'static str> {
+        // Enable FPU
+        unsafe {
+            // Clear CR0.EM (FPU emulation) and set CR0.MP (monitor coprocessor)
+            let mut cr0 = Cr0::read();
+            cr0.remove(Cr0Flags::EMULATE_COPROCESSOR);
+            cr0.insert(Cr0Flags::MONITOR_COPROCESSOR);
+            Cr0::write(cr0);
+            
+            // Enable OSFXSR and OSXMMEXCPT in CR4 for SSE support
+            let mut cr4 = Cr4::read();
+            cr4.insert(Cr4Flags::OSFXSR); // Enable FXSAVE/FXRSTOR
+            cr4.insert(Cr4Flags::OSXMMEXCPT_ENABLE); // Enable SSE exceptions
+            
+            // Enable OSXSAVE if XSAVE is supported
+            if super::has_cpu_feature(super::CpuFeature::Xsave) {
+                cr4.insert(Cr4Flags::OSXSAVE);
+            }
+            
+            Cr4::write(cr4);
+            
+            // Initialize FPU state
+            core::arch::asm!("fninit", options(nostack, nomem));
+            
+            // If XSAVE is supported, enable common features
+            if super::has_cpu_feature(super::CpuFeature::Xsave) {
+                let mut xcr0 = XCr0::read();
+                xcr0.insert(XCr0Flags::X87); // Enable x87 FPU
+                xcr0.insert(XCr0Flags::SSE); // Enable SSE
+                
+                if super::has_cpu_feature(super::CpuFeature::Avx) {
+                    xcr0.insert(XCr0Flags::AVX); // Enable AVX
+                }
+                
+                XCr0::write(xcr0);
+            }
+        }
+        
+        crate::serial::_print(format_args!("[FPU] Initialized with XSAVE support\n"));
+        Ok(())
+    }
+    
+    /// Save FPU state using XSAVE if available, FXSAVE otherwise
+    pub fn save_state(state: &mut FpuState) {
+        unsafe {
+            if super::has_cpu_feature(super::CpuFeature::Xsave) {
+                // Use XSAVE with all features enabled
+                let mask = 0xFFFFFFFFFFFFFFFFu64;
+                core::arch::asm!(
+                    "xsave64 [{}]",
+                    in(reg) state.as_mut_ptr(),
+                    in("rax") mask as u32,
+                    in("rdx") (mask >> 32) as u32,
+                    options(nostack)
+                );
+            } else if super::has_cpu_feature(super::CpuFeature::Fxsr) {
+                // Use FXSAVE (legacy)
+                core::arch::asm!(
+                    "fxsave64 [{}]",
+                    in(reg) state.as_mut_ptr(),
+                    options(nostack)
+                );
+            } else {
+                // Very old CPU - use FSAVE (not recommended)
+                core::arch::asm!(
+                    "fwait",
+                    "fsave [{}]",
+                    in(reg) state.as_mut_ptr(),
+                    options(nostack)
+                );
+            }
+        }
+    }
+    
+    /// Restore FPU state using XRSTOR if available, FXRSTOR otherwise
+    pub fn restore_state(state: &FpuState) {
+        unsafe {
+            if super::has_cpu_feature(super::CpuFeature::Xsave) {
+                // Use XRSTOR with all features enabled
+                let mask = 0xFFFFFFFFFFFFFFFFu64;
+                core::arch::asm!(
+                    "xrstor64 [{}]",
+                    in(reg) state.as_ptr(),
+                    in("rax") mask as u32,
+                    in("rdx") (mask >> 32) as u32,
+                    options(nostack)
+                );
+            } else if super::has_cpu_feature(super::CpuFeature::Fxsr) {
+                // Use FXRSTOR (legacy)
+                core::arch::asm!(
+                    "fxrstor64 [{}]",
+                    in(reg) state.as_ptr(),
+                    options(nostack)
+                );
+            } else {
+                // Very old CPU - use FRSTOR
+                core::arch::asm!(
+                    "frstor [{}]",
+                    in(reg) state.as_ptr(),
+                    options(nostack)
+                );
+            }
+        }
+    }
+    
+    /// Clear FPU state (initialize to default)
+    pub fn clear_state() {
+        unsafe {
+            core::arch::asm!("fninit", options(nostack, nomem));
+        }
+    }
+    
+    /// Enable lazy FPU switching by setting TS bit in CR0
+    pub fn enable_lazy_switching() {
+        unsafe {
+            let mut cr0 = Cr0::read();
+            cr0.insert(Cr0Flags::TASK_SWITCHED);
+            Cr0::write(cr0);
+        }
+    }
+    
+    /// Disable lazy FPU switching by clearing TS bit in CR0
+    pub fn disable_lazy_switching() {
+        unsafe {
+            let mut cr0 = Cr0::read();
+            cr0.remove(Cr0Flags::TASK_SWITCHED);
+            Cr0::write(cr0);
+        }
+    }
+}
+
 /// Initialize CPU security features
 pub fn init_security_features() -> Result<(), &'static str> {
     cr4::init_security_features()
